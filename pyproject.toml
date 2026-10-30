@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling==1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "superset-module-sdk"
+version = "0.1.0"
+description = "Write modules for a Newboot Superset: module twin, secrets, telemetry and reload."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = { paths = ["LICENSE"] }
+authors = [{ name = "Newboot", email = "dev@newboot.io" }]
+requires-python = ">=3.10"
+dependencies = ["paho-mqtt>=2.1,<3"]
+classifiers = [
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/Newboot-io/superset-module-sdk-py"
+Repository = "https://github.com/Newboot-io/superset-module-sdk-py"
+
+[project.optional-dependencies]
+dev = ["cryptography==43.0.3", "mypy==1.13.0", "pytest==8.3.3", "pytest-cov==6.0.0", "ruff==0.7.4"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/superset_module_sdk"]
+
+[tool.mypy]
+strict = true
+files = ["src", "tests", "examples/minimal/main.py", "samples/smoother"]
+mypy_path = "samples/smoother"
+exclude = ["tests/e2e/"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "samples/smoother/tests"]
+pythonpath = ["samples/smoother"]
+addopts = "--ignore=tests/e2e --cov=superset_module_sdk --cov-report=term-missing --cov-fail-under=90"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "W"]
