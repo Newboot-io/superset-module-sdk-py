@@ -18,6 +18,8 @@ from paho.mqtt.subscribeoptions import SubscribeOptions
 
 from ._json import valid_segment
 from ._secret import read_secret, secret_names
+from ._threads import deep_stack
+from ._threads import start_thread as _start_thread
 from .config import ModuleConfig
 from .errors import SdkError, SecretError, TelemetryError, TwinError
 from .messages import (
@@ -40,23 +42,12 @@ log = logging.getLogger("superset_module_sdk")
 # The largest packet the broker may send, announced on CONNECT. paho checks it only after reading a
 # packet, so this relies on the broker (trusted, mutual TLS) honouring it.
 MAX_PACKET_BYTES = 2 * 1024 * 1024 + 1024
-
-# Deeply nested JSON needs more stack than a thread gets by default on some systems (musl).
-THREAD_STACK_BYTES = 8 * 1024 * 1024
-_stack_lock = threading.Lock()
+# A fixed delay between connection attempts, the same in the three SDKs (paho would otherwise back
+# off up to 120 s).
+RECONNECT_AFTER_S = 5
 
 TelemetryHandler = Callable[[Telemetry], None]
 TwinHandler = Callable[[ModuleTwin], None]
-
-
-def _start_thread(target: Callable[[], None]) -> None:
-    """Start a daemon thread with a stack deep enough to parse nested JSON."""
-    with _stack_lock:
-        previous = threading.stack_size(THREAD_STACK_BYTES)
-        try:
-            threading.Thread(target=target, daemon=True).start()
-        finally:
-            threading.stack_size(previous)
 
 
 class ModuleClient:
@@ -85,6 +76,7 @@ class ModuleClient:
                 CallbackAPIVersion.VERSION2, client_id=client_id, protocol=mqtt.MQTTv5
             )
         self._client = mqtt_client
+        self._client.reconnect_delay_set(min_delay=RECONNECT_AFTER_S, max_delay=RECONNECT_AFTER_S)
         self._client.on_connect = self._on_connect
         self._client.on_connect_fail = self._on_connect_fail
         self._client.on_disconnect = self._on_disconnect
@@ -147,12 +139,8 @@ class ModuleClient:
         self._client.connect_async(
             self.config.mqtt.host, self.config.mqtt.port, properties=properties
         )
-        with _stack_lock:
-            previous = threading.stack_size(THREAD_STACK_BYTES)
-            try:
-                self._client.loop_start()
-            finally:
-                threading.stack_size(previous)
+        with deep_stack():  # the loop thread parses received JSON
+            self._client.loop_start()
 
     def is_connected(self) -> bool:
         """Connected and subscribed to the inputs and the command topic: what a module's
@@ -212,6 +200,7 @@ class ModuleClient:
             log.error("mqtt: certificates cannot be loaded: %s", type(error).__name__)
 
     def _on_connect_fail(self, _client: mqtt.Client, _userdata: Any) -> None:
+        log.error("mqtt: connection failed")
         self._load_certificates()
 
     def _on_disconnect(self, *_: Any) -> None:
@@ -230,6 +219,7 @@ class ModuleClient:
         _properties: Properties | None,
     ) -> None:
         if reason_code.is_failure:
+            log.error("mqtt: connection refused: %s", reason_code)
             return
         # The superset broker sends stored messages with the retain flag set, and they are
         # dropped; live ones arrive with the flag cleared. Other brokers skip stored ones.
@@ -248,6 +238,8 @@ class ModuleClient:
         _properties: Properties | None,
     ) -> None:
         self._subscribed = not any(code.is_failure for code in reason_codes)
+        if not self._subscribed:
+            log.error("mqtt: subscription refused")
 
     def _on_message(self, _client: mqtt.Client, _userdata: Any, message: mqtt.MQTTMessage) -> None:
         try:

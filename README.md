@@ -154,11 +154,16 @@ the file while the module runs) and returns the JSON string it holds.
 Starts the MQTT 5 connection over TLS to `brokerUrl` in a background thread and returns at once.
 
 - It never fails for missing or unreadable certificate files: it logs
-  `mqtt: certificates cannot be loaded: <error type>` and paho retries, reading the files again.
+  `mqtt: certificates cannot be loaded: <error type>` and tries again 5 s later, reading the files
+  again.
   Only the module's CA (`mqtt.ca`) is trusted, never the system's.
 - A second `connect()` does nothing; `connect()` after `close()` raises `SdkError`.
-- Client id `<moduleId>-<hostname>`; paho reconnects when the connection drops, and the client
-  certificate and CA are read again before each new attempt.
+- Client id `<moduleId>-<hostname>`. When a connection attempt fails or the connection drops, it
+  tries again every 5 s (a fixed delay, the same in the three SDKs), reading the client certificate
+  and CA again before each attempt.
+- Connection problems are logged, never with certificate contents: `mqtt: connection failed`,
+  `mqtt: connection refused: <reason code>`, `mqtt: subscription refused`,
+  `mqtt: disconnected, reconnecting`.
 - The CONNECT packet announces an MQTT 5 maximum packet size of 2 MiB + 1 KiB (2098176 bytes); see
   [Security notes](#security-notes) for what that does and does not protect.
 - On every connection it subscribes, QoS 1, retain-as-published, without stored messages, to the

@@ -86,7 +86,7 @@ class ModuleConfig:
                 raw = json.load(file)
         except OSError as error:
             raise ConfigError(f"module configuration {path} cannot be read: {error}") from None
-        except ValueError:
+        except (ValueError, RecursionError):
             raise ConfigError(f"module configuration {path} is not valid JSON") from None
         return cls.parse(raw)
 
@@ -114,8 +114,13 @@ class ModuleConfig:
         if root.get("twin") is not None:
             twin_raw = _object(root["twin"], "twin")
             endpoint = _string(twin_raw.get("endpoint"), "twin.endpoint")
-            parsed = urlsplit(endpoint)
-            if parsed.scheme != "https" or not parsed.hostname:
+            try:
+                parsed = urlsplit(endpoint)
+                valid = parsed.scheme == "https" and bool(parsed.hostname)
+                parsed.port  # noqa: B018 (raises ValueError for an invalid port)
+            except ValueError:
+                valid = False
+            if not valid:
                 raise ConfigError("twin.endpoint is not an https URL")
             twin = TwinSettings(
                 ca=_string(twin_raw.get("ca"), "twin.ca"),

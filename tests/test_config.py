@@ -320,3 +320,19 @@ def test_missing_or_non_string_mode_is_unsupported(
         raw_config["mqtt"]["mode"] = mode
     with pytest.raises(UnsupportedModeError):
         ModuleConfig.parse(raw_config)
+
+
+def test_deeply_nested_config_file(tmp_path: Path) -> None:
+    path = tmp_path / "module.json"
+    path.write_text("[" * 100_000 + "]" * 100_000)
+    with pytest.raises(ConfigError, match="not valid JSON"):
+        ModuleConfig.from_file(str(path))
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["https://twin:99999/twin", "https://twin:x/twin", "https://[::1/twin"]
+)
+def test_twin_endpoint_with_an_invalid_url(raw_config: dict[str, Any], endpoint: str) -> None:
+    raw_config["twin"]["endpoint"] = endpoint
+    with pytest.raises(ConfigError, match="twin.endpoint is not an https URL"):
+        ModuleConfig.parse(raw_config)

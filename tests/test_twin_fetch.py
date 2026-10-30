@@ -49,6 +49,8 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(200, json.dumps({"modules": {"other": {}}}).encode())
         elif self.path == "/huge-int":
             self.answer(200, b'{"modules": {"my-module": {"x": 1' + b"0" * 400 + b"}}}")
+        elif self.path == "/deep":
+            self.answer(200, b"[" * 100_000 + b"]" * 100_000)
         elif self.path == "/nan":
             self.answer(200, b'{"modules": {"my-module": {"x": NaN}}}')
 
@@ -149,3 +151,23 @@ def test_fetch_twin_corrupt_certificates(
 def test_fetch_twin_sends_params_exactly_as_given(certs: Certs, server: int) -> None:
     fetch_twin(settings(certs, server, "/twin;v=1?x=1"), MODULE)
     assert Handler.seen_paths[-1] == "/twin;v=1?x=1"
+
+
+def test_deep_answer_from_a_small_stack_thread(certs: Certs, server: int) -> None:
+    """A module calls get_twin from its own threads: the parse must not depend on their stack."""
+    errors: list[BaseException] = []
+
+    def fetch() -> None:
+        try:
+            fetch_twin(settings(certs, server, "/deep"), MODULE)
+        except BaseException as error:
+            errors.append(error)
+
+    previous = threading.stack_size(512 * 1024)
+    try:
+        thread = threading.Thread(target=fetch)
+        thread.start()
+    finally:
+        threading.stack_size(previous)
+    thread.join()
+    assert len(errors) == 1 and isinstance(errors[0], TwinError)

@@ -55,6 +55,7 @@ class FakeMqtt:
         self.calls: list[tuple[str, Any]] = []
         self.subscriptions: list[Any] = []
         self.publish_rc: int = mqtt.MQTT_ERR_SUCCESS
+        self.reconnect_delay: tuple[int, int] | None = None
 
     def publish(self, topic: str, payload: str, qos: int, retain: bool) -> Published:
         self.published.append((topic, json.loads(payload), qos, retain))
@@ -79,6 +80,9 @@ class FakeMqtt:
 
     def disconnect(self) -> None:
         self.calls.append(("disconnect", None))
+
+    def reconnect_delay_set(self, min_delay: int, max_delay: int) -> None:
+        self.reconnect_delay = (min_delay, max_delay)
 
     def subscribe(self, topics: Any) -> None:
         self.subscriptions.append(topics)
@@ -348,7 +352,10 @@ def test_connect_with_missing_certificates_logs_and_returns(
     assert [kind for kind, _ in fake.calls] == ["tls", "connect", "loop_start"]
     assert caplog.messages == ["mqtt: certificates cannot be loaded: FileNotFoundError"]
     sdk._on_connect_fail(cast(mqtt.Client, None), None)  # paho retries: read again, logged
-    assert len(caplog.messages) == 2
+    assert caplog.messages[1:] == [
+        "mqtt: connection failed",
+        "mqtt: certificates cannot be loaded: FileNotFoundError",
+    ]
 
 
 def test_connect_twice_is_a_no_op_and_after_close_an_error(
@@ -388,10 +395,23 @@ def test_on_connect_subscribes_to_commands_and_inputs(
     assert options.retainHandling == SubscribeOptions.RETAIN_DO_NOT_SEND
 
 
-def test_refused_connection_does_not_subscribe(tls_sdk: ModuleClient, fake: FakeMqtt) -> None:
+def test_refused_connection_does_not_subscribe(
+    tls_sdk: ModuleClient, fake: FakeMqtt, caplog: pytest.LogCaptureFixture
+) -> None:
     refused = ReasonCode(PacketTypes.CONNACK, "Not authorized")
     tls_sdk._on_connect(cast(mqtt.Client, fake), None, None, refused, None)
     assert fake.subscriptions == []
+    assert caplog.messages == ["mqtt: connection refused: Not authorized"]
+
+
+def test_reconnects_every_five_seconds(tls_sdk: ModuleClient, fake: FakeMqtt) -> None:
+    assert fake.reconnect_delay == (5, 5)
+    assert client_module.RECONNECT_AFTER_S == 5
+
+
+def test_real_paho_client_gets_the_fixed_delay(raw_config: dict[str, Any]) -> None:
+    sdk = ModuleClient(ModuleConfig.parse(raw_config))
+    assert sdk._client._reconnect_min_delay == 5 and sdk._client._reconnect_max_delay == 5
 
 
 def test_is_connected_means_connected_and_subscribed(tls_sdk: ModuleClient, fake: FakeMqtt) -> None:
@@ -408,6 +428,17 @@ def test_is_connected_means_connected_and_subscribed(tls_sdk: ModuleClient, fake
     ]
     tls_sdk._on_subscribe(cast(mqtt.Client, fake), None, 2, refused, None)
     assert not tls_sdk.is_connected()
+
+
+def test_refused_subscription_is_logged(
+    tls_sdk: ModuleClient, fake: FakeMqtt, caplog: pytest.LogCaptureFixture
+) -> None:
+    granted = [ReasonCode(PacketTypes.SUBACK, "Granted QoS 1")]
+    tls_sdk._on_subscribe(cast(mqtt.Client, fake), None, 1, granted, None)
+    assert caplog.messages == []
+    refused = [ReasonCode(PacketTypes.SUBACK, "Not authorized")]
+    tls_sdk._on_subscribe(cast(mqtt.Client, fake), None, 2, refused, None)
+    assert caplog.messages == ["mqtt: subscription refused"]
 
 
 def test_disconnect_logs_and_reloads_certificates(

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling==1.25.0"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,12 +8,11 @@ version = "0.1.0"
 description = "Write modules for a Newboot Superset: module twin, secrets, telemetry and reload."
 readme = "README.md"
 license = "Apache-2.0"
-license-files = { paths = ["LICENSE"] }
+license-files = ["LICENSE"]
 authors = [{ name = "Newboot", email = "dev@newboot.io" }]
 requires-python = ">=3.10"
 dependencies = ["paho-mqtt>=2.1,<3"]
 classifiers = [
-  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
   "Typing :: Typed",
 ]

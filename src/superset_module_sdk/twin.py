@@ -12,6 +12,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from ._json import parse_json
+from ._threads import call_with_deep_stack
 from .config import TwinSettings
 from .errors import TwinError
 
@@ -142,4 +143,7 @@ def _fetch(
         connection.close()
     if response.status != 200 or len(body) > MAX_TWIN_BYTES:
         raise TwinError(f"module twin answer: HTTP {response.status}, {len(body)} bytes")
-    return validate_twin_answer(parse_json(body), module_id)
+    # Parsed on a deep-stack thread: the caller's own thread may have a small stack, and nested
+    # JSON there would crash the process instead of raising RecursionError.
+    answer = call_with_deep_stack(lambda: parse_json(body))
+    return validate_twin_answer(answer, module_id)
