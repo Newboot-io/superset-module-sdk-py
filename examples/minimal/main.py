@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from superset_module_sdk import ModuleClient, ModuleTwin, SdkError, Telemetry
+from superset_module_sdk import ModuleClient, ModuleTwin, SdkError, Telemetry, TelemetryError
 
 HEALTH_PORT = 8080
 RETRY_TWIN_AFTER_S = 3
@@ -87,8 +87,11 @@ def main() -> None:
         while True:
             if client.is_connected():
                 for variable_id in list(variables):
-                    # The name defaults to the variable's name in the twin.
-                    client.send_telemetry(variable_id, read_sensor(variable_id))
+                    try:
+                        # The name defaults to the variable's name in the twin.
+                        client.send_telemetry(variable_id, read_sensor(variable_id))
+                    except TelemetryError as error:  # names the field, never the value
+                        log.error("telemetry: %s", error)
             time.sleep(SEND_EVERY_S)
     finally:
         client.close()

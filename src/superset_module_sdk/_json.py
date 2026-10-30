@@ -32,9 +32,14 @@ def _finite_int(text: str) -> int:
 
 def parse_json(data: str | bytes | bytearray) -> Any:
     """JSON with every number finite as an IEEE-754 double: no NaN, no Infinity, nothing beyond
-    the double range. A value the module passes on must stay valid JSON everywhere."""
+    the double range. A value the module passes on must stay valid JSON everywhere.
+
+    Bytes must be strict UTF-8, as in the other SDKs: UTF-16 and UTF-32, encoded surrogates and a
+    leading byte order mark are refused (json.loads would detect and accept them from bytes).
+    UnicodeDecodeError is a ValueError."""
+    text = data if isinstance(data, str) else bytes(data).decode("utf-8")
     return json.loads(
-        data, parse_constant=_reject_constant, parse_float=_finite_float, parse_int=_finite_int
+        text, parse_constant=_reject_constant, parse_float=_finite_float, parse_int=_finite_int
     )
 
 

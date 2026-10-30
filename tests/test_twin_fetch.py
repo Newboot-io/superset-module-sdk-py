@@ -49,6 +49,10 @@ class Handler(BaseHTTPRequestHandler):
             self.answer(200, json.dumps({"modules": {"other": {}}}).encode())
         elif self.path == "/huge-int":
             self.answer(200, b'{"modules": {"my-module": {"x": 1' + b"0" * 400 + b"}}}")
+        elif self.path == "/bom":
+            self.answer(200, b"\xef\xbb\xbf" + json.dumps(GOOD).encode())
+        elif self.path == "/utf16":
+            self.answer(200, json.dumps(GOOD).encode("utf-16"))
         elif self.path == "/deep":
             self.answer(200, b"[" * 100_000 + b"]" * 100_000)
         elif self.path == "/nan":
@@ -93,6 +97,8 @@ def test_fetch_twin_with_correlation_id(certs: Certs, server: int) -> None:
         ("/other", "not this module's"),
         ("/nan", "fetch failed"),
         ("/huge-int", "fetch failed"),
+        ("/bom", "fetch failed"),
+        ("/utf16", "fetch failed"),
     ],
 )
 def test_fetch_twin_failures(certs: Certs, server: int, path: str, message: str) -> None:

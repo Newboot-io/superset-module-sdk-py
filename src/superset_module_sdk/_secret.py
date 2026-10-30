@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Iterable
+from functools import partial
 
+from ._json import parse_json
+from ._threads import call_with_deep_stack
 from .errors import SecretError
 
 SECRET_SUFFIX = ".json"
@@ -25,8 +27,10 @@ def read_secret(secret_files: Iterable[str], name: str) -> str:
     for path in secret_files:
         if os.path.basename(path) == f"{name}{SECRET_SUFFIX}":
             try:
-                with open(path, encoding="utf-8") as file:
-                    value = json.load(file)
+                with open(path, "rb") as file:
+                    raw = file.read()
+                # A deep-stack thread: nested JSON never crashes the caller's thread.
+                value = call_with_deep_stack(partial(parse_json, raw))
             except (OSError, ValueError, RecursionError):
                 # Never pass the parse error on: it can quote the file.
                 raise SecretError(f"secret {name} cannot be read") from None

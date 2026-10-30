@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import unicodedata
@@ -11,7 +10,8 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
-from ._json import valid_segment
+from ._json import parse_json, valid_segment
+from ._threads import call_with_deep_stack
 from .errors import ConfigError, UnsupportedModeError
 
 CONFIG_ENV = "MODULE_CONFIG"
@@ -82,10 +82,13 @@ class ModuleConfig:
     @classmethod
     def from_file(cls, path: str) -> ModuleConfig:
         try:
-            with open(path, encoding="utf-8") as file:
-                raw = json.load(file)
+            with open(path, "rb") as file:
+                data = file.read()
         except OSError as error:
             raise ConfigError(f"module configuration {path} cannot be read: {error}") from None
+        try:
+            # A deep-stack thread: nested JSON never crashes the caller's thread.
+            raw = call_with_deep_stack(lambda: parse_json(data))
         except (ValueError, RecursionError):
             raise ConfigError(f"module configuration {path} is not valid JSON") from None
         return cls.parse(raw)

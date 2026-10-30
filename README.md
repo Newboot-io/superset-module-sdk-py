@@ -35,7 +35,7 @@ Import it as `superset_module_sdk`.
 ```python
 import time
 
-from superset_module_sdk import ModuleClient, ModuleTwin, Telemetry
+from superset_module_sdk import ModuleClient, ModuleTwin, Telemetry, TelemetryError
 
 client = ModuleClient.from_env()            # reads /etc/newboot/module.json
 client.check_secrets()                      # stop early if a declared secret is unreadable
@@ -62,8 +62,11 @@ client.connect()                            # background MQTT connection
 while True:
     if client.is_connected():
         for variable_id in list(variables):
-            # The name defaults to the variable's name in the twin.
-            client.send_telemetry(variable_id, 21.5)
+            try:
+                # The name defaults to the variable's name in the twin.
+                client.send_telemetry(variable_id, 21.5)
+            except TelemetryError as error:  # names the field, never the value
+                print("telemetry:", error)
     time.sleep(5)
 ```
 
@@ -154,13 +157,12 @@ the file while the module runs) and returns the JSON string it holds.
 Starts the MQTT 5 connection over TLS to `brokerUrl` in a background thread and returns at once.
 
 - It never fails for missing or unreadable certificate files: it logs
-  `mqtt: certificates cannot be loaded: <error type>` and tries again 5 s later, reading the files
-  again.
+  `mqtt: certificates cannot be loaded: <error type>` and tries again, reading the files again.
   Only the module's CA (`mqtt.ca`) is trusted, never the system's.
 - A second `connect()` does nothing; `connect()` after `close()` raises `SdkError`.
 - Client id `<moduleId>-<hostname>`. When a connection attempt fails or the connection drops, it
-  tries again every 5 s (a fixed delay, the same in the three SDKs), reading the client certificate
-  and CA again before each attempt.
+  tries again about every 5 s (the same in the three SDKs); the first retry after a failed start can
+  take up to 10 s. It reads the client certificate and CA again before each attempt.
 - Connection problems are logged, never with certificate contents: `mqtt: connection failed`,
   `mqtt: connection refused: <reason code>`, `mqtt: subscription refused`,
   `mqtt: disconnected, reconnecting`.
