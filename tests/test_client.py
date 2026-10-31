@@ -19,6 +19,8 @@ from paho.mqtt.subscribeoptions import SubscribeOptions
 
 import superset_module_sdk.client as client_module
 from superset_module_sdk import (
+    Flow,
+    FlowOperation,
     ModuleClient,
     ModuleConfig,
     ModuleTwin,
@@ -527,3 +529,100 @@ def test_from_env_get_twin_and_get_secret(
     assert sdk.get_twin() == TWIN
     assert calls[0][1:] == ("my-module", None)
     assert sdk.config.target.module_id == "my-module"
+
+
+# Flow metrics ---------------------------------------------------------------------------------
+
+
+def counts(sdk: ModuleClient, operation: str) -> tuple[int, int]:
+    """(successes, errors) of one operation, read from metrics()."""
+    found = dict(line.rsplit(" ", 1) for line in sdk.metrics().splitlines() if line[0] != "#")
+    name = f'newboot_flow_operations_total{{operation="{operation}",outcome='
+    return int(found[name + '"success"}']), int(found[name + '"error"}'])
+
+
+def connected(sdk: ModuleClient) -> str:
+    [line] = [line for line in sdk.metrics().splitlines() if line.startswith("newboot_flow_mqtt")]
+    return line.rsplit(" ", 1)[1]
+
+
+def test_metrics_render_the_client_flow(sdk: ModuleClient) -> None:
+    assert isinstance(sdk.flow, Flow)
+    sdk.flow.record(operation=FlowOperation.ACQUIRE, success=False)  # a module's own reads
+    assert sdk.metrics() == sdk.flow.render()
+    assert counts(sdk, "acquire") == (0, 1)
+    assert connected(sdk) == "-1"  # nothing observed yet
+
+
+def test_inputs_count_as_received_and_processed(sdk: ModuleClient) -> None:
+    sdk.on_telemetry(lambda _telemetry: None)
+    sdk._handle(INPUT, b'{"value": 1.5, "variableId": "v"}', False)
+    sdk._handle(INPUT, b'{"value": NaN, "variableId": "v"}', False)
+    sdk._handle(INPUT, b"not json", False)
+    assert counts(sdk, "receive") == (3, 0)
+    assert counts(sdk, "process") == (1, 2)
+
+
+def test_a_failing_handler_is_a_processing_error(sdk: ModuleClient) -> None:
+    def broken(_telemetry: Telemetry) -> None:
+        raise RuntimeError("boom")
+
+    sdk.on_telemetry(broken)
+    sdk._handle(INPUT, b'{"value": 1, "variableId": "v"}', False)
+    assert counts(sdk, "receive") == (1, 0)
+    assert counts(sdk, "process") == (0, 1)
+
+
+def test_retained_inputs_commands_and_other_topics_are_not_counted(
+    sdk: ModuleClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fetches(monkeypatch, lambda: TWIN)
+    sdk._handle(INPUT, b'{"value": 2, "variableId": "v"}', True)
+    sdk._handle("output/telemetry/tenant-a/node-a/other/v", b'{"value": 3}', False)
+    sdk._handle(f"{COMMANDS}/unicast/reload", command("reload", "r-flow"), False)
+    sdk._handle(f"{COMMANDS}/unicast/reload", command("reload", "r-bad", "text"), False)
+    for operation in ("acquire", "receive", "process", "enqueue"):
+        assert counts(sdk, operation) == (0, 0)
+
+
+def test_sent_telemetry_counts_as_enqueued(sdk: ModuleClient, fake: FakeMqtt) -> None:
+    assert sdk.send_telemetry("v", 1)
+    fake.publish_rc = mqtt.MQTT_ERR_NO_CONN
+    assert not sdk.send_telemetry("v", 2)  # refused by the MQTT client
+    fake.connected = False
+    assert not sdk.send_telemetry("v", 3)  # dropped while disconnected
+    with pytest.raises(TelemetryError):
+        sdk.send_telemetry("v", None)  # the caller's mistake, never sent: not counted
+    assert counts(sdk, "enqueue") == (1, 2)
+    assert counts(sdk, "process") == (0, 0)
+
+
+def test_connection_metric_follows_is_connected(tls_sdk: ModuleClient, fake: FakeMqtt) -> None:
+    assert connected(tls_sdk) == "-1"
+    success = ReasonCode(PacketTypes.CONNACK, "Success")
+    tls_sdk._on_connect(cast(mqtt.Client, fake), None, None, success, None)
+    assert connected(tls_sdk) == "-1"  # connected, not yet subscribed
+    granted = [ReasonCode(PacketTypes.SUBACK, "Granted QoS 1")]
+    tls_sdk._on_subscribe(cast(mqtt.Client, fake), None, 1, granted, None)
+    assert connected(tls_sdk) == "1"
+    tls_sdk._on_disconnect()
+    assert connected(tls_sdk) == "0"
+    tls_sdk._on_subscribe(cast(mqtt.Client, fake), None, 2, granted, None)
+    refused = [ReasonCode(PacketTypes.SUBACK, "Not authorized")]
+    tls_sdk._on_subscribe(cast(mqtt.Client, fake), None, 3, refused, None)
+    assert connected(tls_sdk) == "0"
+    tls_sdk._on_subscribe(cast(mqtt.Client, fake), None, 4, granted, None)
+    tls_sdk.close()
+    assert connected(tls_sdk) == "0"
+
+
+@pytest.mark.parametrize("failure", ["refused", "failed"])
+def test_failed_connections_count_as_disconnected(
+    tls_sdk: ModuleClient, fake: FakeMqtt, failure: str
+) -> None:
+    if failure == "refused":
+        refused = ReasonCode(PacketTypes.CONNACK, "Not authorized")
+        tls_sdk._on_connect(cast(mqtt.Client, fake), None, None, refused, None)
+    else:
+        tls_sdk._on_connect_fail(cast(mqtt.Client, fake), None)
+    assert connected(tls_sdk) == "0"

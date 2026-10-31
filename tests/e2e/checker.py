@@ -1,7 +1,7 @@
 """Drives the running example module over the test broker and asserts what the SDK promises:
-telemetry per twin variable, health probes, the reload command and its failures, and silence for
-every command the SDK must not answer. Linked-module input is checked from the module's log by
-run.sh: the checker publishes it here."""
+telemetry per twin variable, health probes, the flow metrics, the reload command and its failures,
+and silence for every command the SDK must not answer. Linked-module input is checked from the
+module's log by run.sh: the checker publishes it here."""
 
 import json
 import os
@@ -48,6 +48,22 @@ COMMAND_PREFIX = f"input/directmethod/{TENANT}/{CLUSTER}/{MODULE}"
 COMMAND_TOPIC = f"{COMMAND_PREFIX}/unicast"
 INPUT_TOPIC = f"output/telemetry/{TENANT}/{NODE}/sensor/v"
 MAX_COMMAND_BYTES = 8192
+METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+FLOW_OPERATIONS = ("acquire", "receive", "process", "enqueue")
+# The exact series of the common module flow contract, no more, no fewer.
+FLOW_SERIES = {
+    "newboot_flow_mqtt_connected",
+    *(
+        f'newboot_flow_operations_total{{operation="{operation}",outcome="{outcome}"}}'
+        for operation in FLOW_OPERATIONS
+        for outcome in ("success", "error")
+    ),
+    *(
+        f'newboot_flow_{kind}_timestamp_seconds{{operation="{operation}"}}'
+        for operation in FLOW_OPERATIONS
+        for kind in ("last_success", "last_error")
+    ),
+}
 MAX_SEGMENT_BYTES = 200
 MAX_TTL_MS = 30_000
 MODULE_HTTP = "http://module:8080"
@@ -170,6 +186,28 @@ def http_status(path):
         return getattr(error, "code", None)
 
 
+def flow_metrics():
+    """GET /metrics, checked for the content type: series -> value."""
+    with urllib.request.urlopen(MODULE_HTTP + "/metrics", timeout=2) as response:
+        check(response.status == 200, "GET /metrics answers 200")
+        content_type = response.headers.get("Content-Type")
+        check(content_type == METRICS_CONTENT_TYPE, f"/metrics content type: {content_type}")
+        text = response.read().decode()
+    samples = [line.rsplit(" ", 1) for line in text.splitlines() if not line.startswith("#")]
+    metrics = {name: float(value) for name, value in samples}
+    check(len(samples) == len(metrics), "/metrics names each series once")
+    check(
+        set(metrics) == FLOW_SERIES, f"/metrics has exactly the 17 flow series: {sorted(metrics)}"
+    )
+    return metrics
+
+
+def operations(metrics, operation, outcome):
+    return metrics.get(
+        f'newboot_flow_operations_total{{operation="{operation}",outcome="{outcome}"}}'
+    )
+
+
 tls = ssl.create_default_context(cafile="/certs/ca.crt")
 tls.load_cert_chain("/certs/checker.pem")
 client = mqtt.Client(CallbackAPIVersion.VERSION2, client_id="checker", protocol=mqtt.MQTTv5)
@@ -196,6 +234,15 @@ while http_status("/readyz") != 200 and time.monotonic() < end:
     time.sleep(0.5)
 check(http_status("/readyz") == 200, "GET /readyz answers 200 once subscribed")
 check(http_status("/healthz") == 200, "GET /healthz answers 200")
+
+# Flow metrics once ready, before any input: connected, the startup telemetry enqueued, nothing
+# received yet (commands and acquire are never counted by the SDK).
+ready = flow_metrics()
+check(ready["newboot_flow_mqtt_connected"] == 1, "newboot_flow_mqtt_connected 1 once ready")
+check(operations(ready, "enqueue", "success") > 0, "startup telemetry counted as enqueued")
+for operation in ("acquire", "receive", "process"):
+    for outcome in ("success", "error"):
+        check(operations(ready, operation, outcome) == 0, f"{operation} {outcome} 0 before inputs")
 
 # Receiving: the module logs what on_telemetry delivers; run.sh reads the log. A retained value,
 # a NaN, a 1e400, nested values and messages over 8 KiB must never reach the handler.
@@ -299,6 +346,28 @@ check(
     next_telemetry(2 * SEND_EVERY_S + 1, STARTUP_VARIABLE) is None,
     "a variable dropped from the twin is no longer sent",
 )
+
+# Flow metrics after the traffic above: each non-retained input received once and processed once.
+# Two are valid (UPSTREAM_VARIABLE and the array); NaN, 1e400, the two nested ones and the two
+# over 8 KiB are dropped, so processing errors; the retained one and every command are not counted.
+metrics = flow_metrics()
+check(metrics["newboot_flow_mqtt_connected"] == 1, "newboot_flow_mqtt_connected 1 at the end")
+received = operations(metrics, "receive", "success")
+processed = operations(metrics, "process", "success")
+dropped = operations(metrics, "process", "error")
+check(received == processed + dropped, f"received {received} = processed {processed} + {dropped}")
+check((received, processed, dropped) == (8, 2, 6), "8 inputs received, 2 processed, 6 dropped")
+check(operations(metrics, "receive", "error") == 0, "no receive errors")
+check(operations(metrics, "enqueue", "error") == 0, "no enqueue errors while connected")
+check(
+    operations(metrics, "enqueue", "success") > operations(ready, "enqueue", "success"), "enqueued"
+)
+check(
+    operations(metrics, "acquire", "success") == operations(metrics, "acquire", "error") == 0,
+    "acquire stays at zero",
+)
+stamp = metrics.get('newboot_flow_last_success_timestamp_seconds{operation="enqueue"}')
+check(stamp is not None and abs(stamp - time.time()) < 60, f"last enqueue success is now: {stamp}")
 
 client.loop_stop()
 print("ALL CHECKS PASSED", flush=True)
