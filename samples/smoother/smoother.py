@@ -21,7 +21,13 @@ from smoothing import (
     temperature_value,
 )
 
-from superset_module_sdk import ModuleClient, ModuleTwin, SdkError, Telemetry
+from superset_module_sdk import (
+    METRICS_CONTENT_TYPE,
+    ModuleClient,
+    ModuleTwin,
+    SdkError,
+    Telemetry,
+)
 
 HEALTH_PORT = 8080
 LOG_EVERY = 100
@@ -78,7 +84,17 @@ def main() -> None:
     smoother = Smoother(client)
 
     class Health(BaseHTTPRequestHandler):
+        timeout = 5  # an idle client never holds a thread for long
+
         def do_GET(self) -> None:  # noqa: N802 (http.server's name)
+            if self.path == "/metrics":  # the flow metrics the console reads
+                body = client.metrics().encode()
+                self.send_response(200)
+                self.send_header("Content-Type", METRICS_CONTENT_TYPE)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             ok = self.path == "/healthz" or (self.path == "/readyz" and client.is_connected())
             self.send_response(200 if ok else 503)
             self.end_headers()

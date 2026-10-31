@@ -51,10 +51,13 @@ None. The module still calls `check_secrets()` at start, as every sample does.
 Variable ids and message counts only, never values: the twin settings in use, the variable ids it
 sends to, and a count of received temperatures (the first, then every 100th).
 
-## Health
+## Health and metrics
 
 `/healthz` answers 200 while the process runs. `/readyz` answers 200 once the SDK reports
-`is_connected()`, meaning connected and subscribed. Both are on port 8080.
+`is_connected()`, meaning connected and subscribed. `/metrics` answers the SDK's flow metrics
+(`client.metrics()`, Prometheus text), which the console's data-flow view reads: each message on
+its input counts as `receive` and `process`, each sent `temp_avg` and `temp_f` as `enqueue`. All
+three are on port 8080.
 
 ## Build
 

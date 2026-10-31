@@ -7,7 +7,8 @@ for you, so a module can:
 - read its **secrets**,
 - **send telemetry** on its own topic,
 - **receive telemetry** from the modules the Superset links to it,
-- follow **twin changes**: the built-in answer to the Superset's `reload` command.
+- follow **twin changes**: the built-in answer to the Superset's `reload` command,
+- report its **activity**: the [flow metrics](#flow-metrics) the Newboot console reads.
 
 Sister libraries with the same API shape and the same wire behaviour:
 [superset-module-sdk-ts](https://github.com/Newboot-io/superset-module-sdk-ts) (TypeScript) and
@@ -70,8 +71,8 @@ while True:
     time.sleep(5)
 ```
 
-A complete module, with `/healthz` and `/readyz` on port 8080, a retry loop for the twin at start
-and a Dockerfile, is in [`examples/minimal`](examples/minimal).
+A complete module, with `/healthz`, `/readyz` and `/metrics` on port 8080, a retry loop for the
+twin at start and a Dockerfile, is in [`examples/minimal`](examples/minimal).
 
 [`samples/smoother`](samples/smoother) is a module of the three-language sample pipeline: it
 averages the `temperature` a linked module sends and passes `temp_avg` and `temp_f` on.
@@ -174,6 +175,31 @@ Starts the MQTT 5 connection over TLS to `brokerUrl` in a background thread and 
 - `is_connected() -> bool` is true when the client is connected **and** subscribed: it is what your
   module's `/readyz` should answer.
 
+### `metrics() -> str`
+
+The [flow metrics](#flow-metrics) in the Prometheus text format: what your module's `GET /metrics`
+on port 8080 should answer, with the content type `METRICS_CONTENT_TYPE`
+(`text/plain; version=0.0.4; charset=utf-8`), exported from `superset_module_sdk`:
+
+```python
+from superset_module_sdk import METRICS_CONTENT_TYPE
+
+# in a BaseHTTPRequestHandler subclass that sets `timeout = 5`, as both samples do, so an idle
+# client never holds a thread for long; its do_GET:
+if self.path == "/metrics":
+    body = client.metrics().encode()
+    self.send_response(200)
+    self.send_header("Content-Type", METRICS_CONTENT_TYPE)
+    self.send_header("Content-Length", str(len(body)))
+    self.end_headers()
+    self.wfile.write(body)
+```
+
+`client.flow` is the `Flow` the client records into. A module that reads a machine or sensor counts
+each read there: `client.flow.record(operation=FlowOperation.ACQUIRE, success=True)` (or `False`
+when the read or its connection fails). `Flow` and `FlowOperation` are exported from
+`superset_module_sdk`.
+
 ### `send_telemetry(variable_id, value, name=None, timestamp=None) -> bool`
 
 Publishes `{"variableId", "value", "timestamp", "name"}` as JSON on
@@ -188,7 +214,9 @@ to received telemetry:
   (`1.7e12`) counts and is sent as an integer. Defaults to now.
 - `name`: a string; when not given, the variable's `name` in the last fetched twin, else left out.
 - **Returns** `True` when handed to the connected client, `False` when the client is not connected
-  and subscribed, including before `connect()`. Nothing is queued while disconnected.
+  and subscribed, including before `connect()`, or when the MQTT client refuses the publish (an
+  `rc` other than `MQTT_ERR_SUCCESS`). Either `False` counts as an `enqueue` error in the
+  [flow metrics](#flow-metrics). Nothing is queued while disconnected.
 - **Raises** `TelemetryError` naming the invalid field (`telemetry value is not valid`), including
   for a `variable_id` that is not a string.
 
@@ -213,6 +241,35 @@ are skipped, and the reload answers `reload_failed`.
 ### `close() -> None`
 
 Disconnects and stops the background thread. The client cannot connect again.
+
+## Flow metrics
+
+The console's data-flow view shows each deployed module as flowing, idle, failing or "Activity
+unknown" from 17 series on the module's `/metrics` (Newboot's common module flow contract, the same
+in every module and SDK). The collector scrapes the container named `module` on its port named
+`http` (8080) every 15 s. A module without `/metrics` stays "Activity unknown".
+
+| Series | Meaning |
+| --- | --- |
+| `newboot_flow_operations_total{operation,outcome}` | Counter: completed operations, outcome `success` or `error` |
+| `newboot_flow_last_success_timestamp_seconds{operation}` | Gauge: last success, Unix seconds; 0 before the first |
+| `newboot_flow_last_error_timestamp_seconds{operation}` | Gauge: last error, Unix seconds; 0 before the first |
+| `newboot_flow_mqtt_connected` | Gauge: `1` connected and subscribed, `0` not, `-1` not yet known |
+
+The client records each operation once, where it happens:
+
+| Operation | Counted by | Success | Error |
+| --- | --- | --- | --- |
+| `acquire` | Your module, through `client.flow` (stays 0 otherwise) | A read from the machine | A failed read or connection |
+| `receive` | The SDK | A message on an input topic (`configuration.inputs`), retained ones excepted | Never |
+| `process` | The SDK | The message is valid telemetry and every `on_telemetry` handler returned | The message is dropped (see `on_telemetry`) or a handler raised |
+| `enqueue` | The SDK | `send_telemetry` handed the message to the MQTT client | Not connected and subscribed, or the MQTT client refused it |
+
+Commands, `reload` included, and their replies are never counted. The series carry no other label:
+no variable id, topic, value or error. The counters start at zero when the process starts and reset
+when it restarts; the console reads rates over 2 minutes, which handle resets. A successful
+`enqueue` means the local MQTT client took the message, not that the broker or the cloud received
+it.
 
 ## Reload behaviour
 
@@ -269,7 +326,7 @@ ruff check . && ruff format --check .
 The end-to-end test builds `examples/minimal`, starts a throwaway CA, an MQTT broker with a
 default-deny access list and a module twin server on an internal Docker network, runs the module
 the way the Superset does (uid 10001, read-only root, no capabilities) and checks telemetry,
-health endpoints, reload answers and failures, ignored commands, dropped inputs and secret
+health endpoints, flow metrics, reload answers and failures, ignored commands, dropped inputs and secret
 handling. It needs Docker only, and removes everything it creates:
 
 ```sh

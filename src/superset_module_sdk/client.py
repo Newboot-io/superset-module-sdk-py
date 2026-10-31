@@ -22,6 +22,7 @@ from ._threads import deep_stack
 from ._threads import start_thread as _start_thread
 from .config import ModuleConfig
 from .errors import SdkError, SecretError, TelemetryError, TwinError
+from .flow import Flow, FlowOperation
 from .messages import (
     INVALID_PAYLOAD,
     RELOAD,
@@ -54,7 +55,9 @@ class ModuleClient:
     """A module's connection to its superset.
 
     `get_twin()` and `get_secret()` work without `connect()`. `connect()` starts the MQTT
-    connection in the background; `is_connected()` tells a health endpoint how it is.
+    connection in the background; `is_connected()` tells a health endpoint how it is, and
+    `metrics()` gives its /metrics endpoint the flow metrics the client records. Use one client
+    per process.
     """
 
     def __init__(self, config: ModuleConfig, mqtt_client: mqtt.Client | None = None) -> None:
@@ -70,6 +73,7 @@ class ModuleClient:
         self._command_prefix = command_topic(config.target) + "/"
         self._tls: ssl.SSLContext | None = None
         self._twin: ModuleTwin | None = None
+        self._flow = Flow()
         if mqtt_client is None:
             client_id = f"{config.target.module_id}-{socket.gethostname()}"
             mqtt_client = mqtt.Client(
@@ -147,6 +151,17 @@ class ModuleClient:
         /readyz should answer."""
         return self._subscribed and self._client.is_connected()
 
+    @property
+    def flow(self) -> Flow:
+        """The flow metrics this client records: the MQTT connection, inputs received and
+        processed, telemetry enqueued. A module that reads hardware records `acquire` here."""
+        return self._flow
+
+    def metrics(self) -> str:
+        """The flow metrics in the Prometheus text format: what a module's /metrics should
+        answer, with the content type METRICS_CONTENT_TYPE."""
+        return self._flow.render()
+
     def send_telemetry(
         self,
         variable_id: str,
@@ -156,7 +171,8 @@ class ModuleClient:
     ) -> bool:
         """Publish one value on this module's telemetry topic (QoS 0, not retained). Without a
         name, the variable's name in the last fetched twin is used, if it has one. Returns False
-        when the client is not connected (also before connect()): the value is dropped."""
+        when the client is not connected (also before connect()) or the MQTT client refuses the
+        publish: the value is dropped and counted as an enqueue error."""
         if not valid_segment(variable_id):
             raise TelemetryError("telemetry variableId is not valid")
         if name is None and self._twin is not None:
@@ -166,9 +182,12 @@ class ModuleClient:
             name = twin_name if isinstance(twin_name, str) else None
         payload = telemetry_payload(variable_id, value, name, timestamp)
         if not self.is_connected():
+            self._flow.record(operation=FlowOperation.ENQUEUE, success=False)
             return False
         info = self._client.publish(self._telemetry_topic, payload, qos=0, retain=False)
-        return info.rc == mqtt.MQTT_ERR_SUCCESS
+        accepted = info.rc == mqtt.MQTT_ERR_SUCCESS
+        self._flow.record(operation=FlowOperation.ENQUEUE, success=accepted)
+        return accepted
 
     def on_telemetry(self, handler: TelemetryHandler) -> None:
         """Call `handler` for each message from a linked module (configuration.inputs)."""
@@ -185,6 +204,7 @@ class ModuleClient:
         self._client.disconnect()
         self._client.loop_stop()
         self._subscribed = False
+        self._flow.connection(False)
 
     # Callbacks -------------------------------------------------------------------------------
 
@@ -201,10 +221,12 @@ class ModuleClient:
 
     def _on_connect_fail(self, _client: mqtt.Client, _userdata: Any) -> None:
         log.error("mqtt: connection failed")
+        self._flow.connection(False)
         self._load_certificates()
 
     def _on_disconnect(self, *_: Any) -> None:
         self._subscribed = False
+        self._flow.connection(False)
         if self._closing:
             return
         log.error("mqtt: disconnected, reconnecting")
@@ -220,6 +242,7 @@ class ModuleClient:
     ) -> None:
         if reason_code.is_failure:
             log.error("mqtt: connection refused: %s", reason_code)
+            self._flow.connection(False)
             return
         # The superset broker sends stored messages with the retain flag set, and they are
         # dropped; live ones arrive with the flag cleared. Other brokers skip stored ones.
@@ -238,6 +261,7 @@ class ModuleClient:
         _properties: Properties | None,
     ) -> None:
         self._subscribed = not any(code.is_failure for code in reason_codes)
+        self._flow.connection(self._subscribed)  # what is_connected() answers from now on
         if not self._subscribed:
             log.error("mqtt: subscription refused")
 
@@ -249,13 +273,19 @@ class ModuleClient:
 
     def _handle(self, topic: str, payload: bytes, retain: bool) -> None:
         if topic in self.config.inputs:
+            if retain:
+                return  # a stored message, dropped on purpose: neither received nor processed
+            self._flow.record(operation=FlowOperation.RECEIVE, success=True)
             telemetry = parse_telemetry(topic, payload, retain)
+            processed = telemetry is not None
             if telemetry is not None:
                 for handler in list(self._telemetry_handlers):
                     try:
                         handler(telemetry)
                     except Exception as error:  # its message may hold values: type only
                         log.error("telemetry handler failed: %s", type(error).__name__)
+                        processed = False
+            self._flow.record(operation=FlowOperation.PROCESS, success=processed)
             return
         if not topic.startswith(self._command_prefix):
             return
