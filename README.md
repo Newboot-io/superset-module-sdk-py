@@ -153,6 +153,13 @@ the file while the module runs) and returns the JSON string it holds.
 `secret_names()` lists the declared secrets. `check_secrets()` reads every one of them and raises
 `SecretError` naming the first that cannot be read: call it at start to stop early.
 
+Each secret your module reads is declared in its description in your Superset catalog: its name
+(lowercase letters, digits and hyphens: the `<name>` of its file), a short label and what it is
+for. Whoever manages the cluster sets each value on the module's **Secrets** tab in the Newboot
+console, which shows that label and purpose. A deploy is refused until every secret the module
+uses has a value; a new value replaces the file within about five minutes while the module runs.
+Values are write-only: neither the console nor the API reads one back.
+
 ### `connect() -> None`
 
 Starts the MQTT 5 connection over TLS to `brokerUrl` in a background thread and returns at once.
