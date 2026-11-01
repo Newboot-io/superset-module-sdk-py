@@ -44,7 +44,8 @@ by name.
 
 ## Secrets
 
-None. The module still calls `check_secrets()` at start, as every sample does.
+None: its description declares no secret, so its **Secrets** tab in the console lists none. The
+module still calls `check_secrets()` at start, as every sample does.
 
 ## Logs
 
