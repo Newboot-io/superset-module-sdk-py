@@ -35,7 +35,7 @@ from .messages import (
     reply_payload,
     telemetry_payload,
 )
-from .topics import command_subscription, command_topic, telemetry_topic
+from .topics import command_subscription, command_topic, files_topic, telemetry_topic
 from .twin import ModuleTwin, fetch_twin
 
 log = logging.getLogger("superset_module_sdk")
@@ -185,6 +185,43 @@ class ModuleClient:
             self._flow.record(operation=FlowOperation.ENQUEUE, success=False)
             return False
         info = self._client.publish(self._telemetry_topic, payload, qos=0, retain=False)
+        accepted = info.rc == mqtt.MQTT_ERR_SUCCESS
+        self._flow.record(operation=FlowOperation.ENQUEUE, success=accepted)
+        return accepted
+
+    def send_file(
+        self,
+        *,
+        name: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> bool:
+        """Publish one file on this module's files topic (`output/files/.../{name}`, QoS 0, not
+        retained), with its MQTT 5 Content-Type property. The broker accepts it only while a
+        `files` route (e.g. Azure Blob Storage) leaves this module. Returns False when the client
+        is not connected or the MQTT client refuses the publish."""
+        if not valid_segment(name) or ".." in name:
+            raise SdkError("file name is not valid")
+        if not isinstance(data, bytes) or not 0 < len(data) <= MAX_PACKET_BYTES:
+            raise SdkError("file data is not valid")
+        if (
+            not isinstance(content_type, str)
+            or not content_type.strip()
+            or any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in content_type)
+        ):
+            raise SdkError("file content type is not valid")
+        if not self.is_connected():
+            self._flow.record(operation=FlowOperation.ENQUEUE, success=False)
+            return False
+        properties = Properties(PacketTypes.PUBLISH)  # type: ignore[no-untyped-call]
+        properties.ContentType = content_type
+        info = self._client.publish(
+            files_topic(self.config.target, name),
+            data,
+            qos=0,
+            retain=False,
+            properties=properties,
+        )
         accepted = info.rc == mqtt.MQTT_ERR_SUCCESS
         self._flow.record(operation=FlowOperation.ENQUEUE, success=accepted)
         return accepted
