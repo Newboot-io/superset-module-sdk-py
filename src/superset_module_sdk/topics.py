@@ -10,6 +10,11 @@ def telemetry_topic(target: Target) -> str:
     return f"output/telemetry/{target.tenant_config_id}/{target.node_id}/{target.module_id}/v"
 
 
+def files_topic(target: Target, name: str) -> str:
+    """Where the module publishes a file for a `files` route (e.g. Azure Blob Storage)."""
+    return f"output/files/{target.tenant_config_id}/{target.node_id}/{target.module_id}/{name}"
+
+
 def command_topic(target: Target) -> str:
     """The prefix of the module's commands: `<prefix>/<delivery>/<command>`."""
     return f"input/directmethod/{target.tenant_config_id}/{target.cluster_id}/{target.module_id}"
