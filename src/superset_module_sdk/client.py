@@ -1,4 +1,5 @@
-"""ModuleClient: the module twin, secrets, telemetry out and in, and the reload command."""
+"""ModuleClient: the module twin, secrets, telemetry and image frames out and in, and the reload
+command."""
 
 from __future__ import annotations
 
@@ -21,21 +22,25 @@ from ._secret import read_secret, secret_names
 from ._threads import deep_stack
 from ._threads import start_thread as _start_thread
 from .config import ModuleConfig
-from .errors import SdkError, SecretError, TelemetryError, TwinError
+from .errors import FrameError, SdkError, SecretError, TelemetryError, TwinError
 from .flow import Flow, FlowOperation
 from .messages import (
     INVALID_PAYLOAD,
+    MAX_FRAME_BYTES,
     RELOAD,
     RELOAD_FAILED,
     Command,
+    Frame,
     Telemetry,
+    frame_metadata,
     now_ms,
     parse_command,
+    parse_frame,
     parse_telemetry,
     reply_payload,
     telemetry_payload,
 )
-from .topics import command_subscription, command_topic, telemetry_topic
+from .topics import command_subscription, command_topic, frame_topic, telemetry_topic
 from .twin import ModuleTwin, fetch_twin
 
 log = logging.getLogger("superset_module_sdk")
@@ -48,6 +53,7 @@ MAX_PACKET_BYTES = 2 * 1024 * 1024 + 1024
 RECONNECT_AFTER_S = 5
 
 TelemetryHandler = Callable[[Telemetry], None]
+FrameHandler = Callable[[Frame], None]
 TwinHandler = Callable[[ModuleTwin], None]
 
 
@@ -63,6 +69,7 @@ class ModuleClient:
     def __init__(self, config: ModuleConfig, mqtt_client: mqtt.Client | None = None) -> None:
         self.config = config
         self._telemetry_handlers: list[TelemetryHandler] = []
+        self._frame_handlers: list[FrameHandler] = []
         self._twin_handlers: list[TwinHandler] = []
         self._reloading = threading.Lock()
         self._closing = False
@@ -70,6 +77,9 @@ class ModuleClient:
         self._started = False
         self._subscribed = False
         self._telemetry_topic = telemetry_topic(config.target)
+        self._frame_topic = frame_topic(config.target)
+        # The broker's own packet limit, from its CONNACK; 2 MiB until it announces one.
+        self._broker_max_packet = MAX_FRAME_BYTES
         self._command_prefix = command_topic(config.target) + "/"
         self._tls: ssl.SSLContext | None = None
         self._twin: ModuleTwin | None = None
@@ -189,6 +199,47 @@ class ModuleClient:
         self._flow.record(operation=FlowOperation.ENQUEUE, success=accepted)
         return accepted
 
+    def send_frame(
+        self,
+        data: bytes,
+        content_type: str,
+        *,
+        frame_id: str | None = None,
+        timestamp: int | float | None = None,
+    ) -> bool:
+        """Publish one image frame on this module's frame topic (QoS 0, not retained), for the
+        modules the superset forwards its frames to; frames never leave the cluster. The content
+        type (such as image/jpeg) and the frameId and timestamp (epoch ms, now when not given)
+        travel as MQTT v5 properties. Raises FrameError for invalid metadata or a frame the
+        broker would refuse as too large. Returns False when the client is not connected (also
+        before connect()) or the MQTT client refuses the publish: the frame is dropped and
+        counted as an enqueue error."""
+        if not isinstance(data, bytes | bytearray | memoryview):
+            raise FrameError("frame data is not bytes")
+        payload = bytes(data)
+        if not payload:
+            raise FrameError("frame data is empty")
+        content_type, user_properties = frame_metadata(content_type, frame_id, timestamp)
+        properties = Properties(PacketTypes.PUBLISH)  # type: ignore[no-untyped-call]
+        properties.ContentType = content_type
+        properties.UserProperty = user_properties
+        if self._packet_bytes(self._frame_topic, properties, payload) > self._frame_limit():
+            raise FrameError("frame is larger than the broker accepts")
+        if not self.is_connected():
+            self._flow.record(operation=FlowOperation.ENQUEUE, success=False)
+            return False
+        info = self._client.publish(
+            self._frame_topic, payload, qos=0, retain=False, properties=properties
+        )
+        accepted = info.rc == mqtt.MQTT_ERR_SUCCESS
+        self._flow.record(operation=FlowOperation.ENQUEUE, success=accepted)
+        return accepted
+
+    def on_frame(self, handler: FrameHandler) -> None:
+        """Call `handler` for each frame from a module that forwards its frames to this one
+        (configuration.frameInputs)."""
+        self._frame_handlers.append(handler)
+
     def on_telemetry(self, handler: TelemetryHandler) -> None:
         """Call `handler` for each message from a linked module (configuration.inputs)."""
         self._telemetry_handlers.append(handler)
@@ -205,6 +256,19 @@ class ModuleClient:
         self._client.loop_stop()
         self._subscribed = False
         self._flow.connection(False)
+
+    def _frame_limit(self) -> int:
+        # A frame fits the platform's 2 MiB and the broker's own limit, whichever is smaller.
+        return min(MAX_FRAME_BYTES, self._broker_max_packet)
+
+    @staticmethod
+    def _packet_bytes(topic: str, properties: Properties, payload: bytes) -> int:
+        """The size of a QoS 0 PUBLISH packet: fixed header, topic, properties, payload."""
+        remaining = 2 + len(topic.encode()) + len(properties.pack()) + len(payload)  # type: ignore[no-untyped-call]
+        length_bytes = 1
+        while remaining >= 128**length_bytes:
+            length_bytes += 1
+        return 1 + length_bytes + remaining
 
     # Callbacks -------------------------------------------------------------------------------
 
@@ -238,19 +302,27 @@ class ModuleClient:
         _userdata: Any,
         _flags: Any,
         reason_code: ReasonCode,
-        _properties: Properties | None,
+        properties: Properties | None,
     ) -> None:
         if reason_code.is_failure:
             log.error("mqtt: connection refused: %s", reason_code)
             self._flow.connection(False)
             return
+        announced = getattr(properties, "MaximumPacketSize", None)
+        self._broker_max_packet = announced if isinstance(announced, int) else MAX_FRAME_BYTES
         # The superset broker sends stored messages with the retain flag set, and they are
         # dropped; live ones arrive with the flag cleared. Other brokers skip stored ones.
         options = SubscribeOptions(
             qos=1, retainAsPublished=True, retainHandling=SubscribeOptions.RETAIN_DO_NOT_SEND
         )
         topics = [command_subscription(self.config.target), *self.config.inputs]
-        client.subscribe([(topic, options) for topic in topics])
+        subscriptions = [(topic, options) for topic in topics]
+        # Frames are sent at QoS 0 and dropped under load rather than queued: receive them so.
+        frame_options = SubscribeOptions(
+            qos=0, retainAsPublished=True, retainHandling=SubscribeOptions.RETAIN_DO_NOT_SEND
+        )
+        subscriptions += [(topic, frame_options) for topic in self.config.frame_inputs]
+        client.subscribe(subscriptions)
 
     def _on_subscribe(
         self,
@@ -267,11 +339,16 @@ class ModuleClient:
 
     def _on_message(self, _client: mqtt.Client, _userdata: Any, message: mqtt.MQTTMessage) -> None:
         try:
-            self._handle(message.topic, message.payload, bool(message.retain))
+            self._handle(message.topic, message.payload, bool(message.retain), message.properties)
         except Exception as error:  # never let one bad message stop the MQTT loop
             log.error("message ignored: %s", type(error).__name__)
 
-    def _handle(self, topic: str, payload: bytes, retain: bool) -> None:
+    def _handle(
+        self, topic: str, payload: bytes, retain: bool, properties: Properties | None = None
+    ) -> None:
+        if topic in self.config.frame_inputs:
+            self._handle_frame(topic, payload, retain, properties)
+            return
         if topic in self.config.inputs:
             if retain:
                 return  # a stored message, dropped on purpose: neither received nor processed
@@ -297,6 +374,30 @@ class ModuleClient:
             self._reply(command, {"error": INVALID_PAYLOAD})
             return
         _start_thread(lambda: self._reload(command))
+
+    def _handle_frame(
+        self, topic: str, payload: bytes, retain: bool, properties: Properties | None
+    ) -> None:
+        if retain:
+            return  # a stored message, dropped on purpose: neither received nor processed
+        self._flow.record(operation=FlowOperation.RECEIVE, success=True)
+        user_properties = getattr(properties, "UserProperty", None)
+        frame = parse_frame(
+            topic,
+            payload,
+            retain,
+            getattr(properties, "ContentType", None),
+            user_properties if isinstance(user_properties, list) else [],
+        )
+        processed = frame is not None
+        if frame is not None:
+            for handler in list(self._frame_handlers):
+                try:
+                    handler(frame)
+                except Exception as error:  # its message may hold values: type only
+                    log.error("frame handler failed: %s", type(error).__name__)
+                    processed = False
+        self._flow.record(operation=FlowOperation.PROCESS, success=processed)
 
     def _reload(self, command: Command) -> None:
         # One reload at a time.

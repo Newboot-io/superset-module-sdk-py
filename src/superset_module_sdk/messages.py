@@ -1,18 +1,26 @@
-"""Pure message rules: telemetry payloads, linked-module input, command envelopes."""
+"""Pure message rules: telemetry payloads, linked-module input, image frames, command envelopes."""
 
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 from ._json import dump_json, is_int, parse_json, valid_segment
 from .config import Target
-from .errors import TelemetryError
+from .errors import FrameError, TelemetryError
 from .topics import command_topic, reply_topic
 
 DELIVERIES = ("broadcast", "unicast")
+# The superset's frame contract: one frame per message, at most the broker's 2 MiB packet.
+MAX_FRAME_BYTES = 2 * 1024 * 1024
+FRAME_ID_PROPERTY = "frameId"
+FRAME_TIMESTAMP_PROPERTY = "timestamp"
+# A plain type/subtype media type, such as image/jpeg: no parameters, at most 127 characters.
+_CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*")
+MAX_CONTENT_TYPE_LENGTH = 127
 MAX_CLOCK_SKEW_MS = 1000
 MAX_MESSAGE_BYTES = 8192
 MAX_TTL_MS = 30_000
@@ -118,6 +126,90 @@ def parse_telemetry(topic: str, payload: bytes, retain: bool) -> Telemetry | Non
         value=message["value"],
         name=message.get("name"),
         timestamp=timestamp_ms(message.get("timestamp")),
+    )
+
+
+def valid_content_type(value: object) -> bool:
+    """A plain type/subtype media type, such as image/jpeg."""
+    return (
+        isinstance(value, str)
+        and len(value) <= MAX_CONTENT_TYPE_LENGTH
+        and _CONTENT_TYPE.fullmatch(value) is not None
+    )
+
+
+def frame_metadata(
+    content_type: str, frame_id: str | None, timestamp: int | float | None
+) -> tuple[str, list[tuple[str, str]]]:
+    """The content type and user properties of a frame to send: frameId when given, and
+    timestamp (epoch ms, now when not given). Raises FrameError naming the field that is
+    invalid."""
+    if not valid_content_type(content_type):
+        raise FrameError("frame content type is not a type/subtype media type")
+    properties: list[tuple[str, str]] = []
+    if frame_id is not None:
+        if not valid_segment(frame_id):
+            raise FrameError("frame id is not valid")
+        properties.append((FRAME_ID_PROPERTY, frame_id))
+    stamp = timestamp_ms(now_ms() if timestamp is None else timestamp)
+    if stamp is None:
+        raise FrameError("frame timestamp is not valid")
+    properties.append((FRAME_TIMESTAMP_PROPERTY, str(stamp)))
+    return content_type, properties
+
+
+@dataclass(frozen=True)
+class Frame:
+    """An image frame from a module the superset forwards to this one (configuration.frameInputs).
+    `data` holds the image bytes as sent; `module_id` names the module that sent it."""
+
+    topic: str
+    module_id: str
+    data: bytes
+    content_type: str | None
+    frame_id: str | None
+    timestamp: int | None
+
+
+def _frame_timestamp(text: str) -> int | None:
+    # Decimal digits only: no sign, no space, no exponent.
+    return timestamp_ms(int(text)) if text.isascii() and text.isdigit() else None
+
+
+def parse_frame(
+    topic: str,
+    payload: bytes,
+    retain: bool,
+    content_type: object,
+    user_properties: list[tuple[str, str]],
+) -> Frame | None:
+    """A forwarded frame, or None: retained, empty and oversized frames are dropped, as are
+    frames whose content type, frameId or timestamp is invalid or given twice. Other user
+    properties are ignored."""
+    if retain or not 0 < len(payload) <= MAX_FRAME_BYTES:
+        return None
+    if content_type is not None and not valid_content_type(content_type):
+        return None
+    values: dict[str, list[str]] = {}
+    for name, value in user_properties:
+        values.setdefault(name, []).append(value)
+    frame_ids = values.get(FRAME_ID_PROPERTY, [])
+    stamps = values.get(FRAME_TIMESTAMP_PROPERTY, [])
+    if len(frame_ids) > 1 or len(stamps) > 1:
+        return None
+    frame_id = frame_ids[0] if frame_ids else None
+    if frame_id is not None and not valid_segment(frame_id):
+        return None
+    stamp = _frame_timestamp(stamps[0]) if stamps else None
+    if stamps and stamp is None:
+        return None
+    return Frame(
+        topic=topic,
+        module_id=topic.rsplit("/", 1)[-1],
+        data=bytes(payload),
+        content_type=content_type if isinstance(content_type, str) else None,
+        frame_id=frame_id,
+        timestamp=stamp,
     )
 
 

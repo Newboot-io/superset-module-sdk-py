@@ -48,6 +48,8 @@ class FakeMqtt:
 
     def __init__(self) -> None:
         self.published: list[tuple[str, dict[str, Any], int, bool]] = []
+        # Publishes with MQTT v5 properties (image frames): raw payload and properties.
+        self.frames: list[tuple[str, bytes, int, bool, Any]] = []
         self.on_connect: Any = None
         self.on_connect_fail: Any = None
         self.on_disconnect: Any = None
@@ -59,8 +61,14 @@ class FakeMqtt:
         self.publish_rc: int = mqtt.MQTT_ERR_SUCCESS
         self.reconnect_delay: tuple[int, int] | None = None
 
-    def publish(self, topic: str, payload: str, qos: int, retain: bool) -> Published:
-        self.published.append((topic, json.loads(payload), qos, retain))
+    def publish(
+        self, topic: str, payload: str | bytes, qos: int, retain: bool, properties: Any = None
+    ) -> Published:
+        if properties is None:
+            self.published.append((topic, json.loads(payload), qos, retain))
+        else:
+            assert isinstance(payload, bytes)
+            self.frames.append((topic, payload, qos, retain, properties))
         result = Published()
         result.rc = self.publish_rc
         return result

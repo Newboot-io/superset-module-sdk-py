@@ -71,6 +71,7 @@ class ModuleConfig:
     target: Target
     twin: TwinSettings | None = None
     inputs: tuple[str, ...] = ()
+    frame_inputs: tuple[str, ...] = ()
     secret_files: tuple[str, ...] = ()
     configuration: Mapping[str, Any] = field(default_factory=dict)
 
@@ -142,6 +143,7 @@ class ModuleConfig:
             target=target,
             twin=twin,
             inputs=_inputs(configuration.get("inputs", [])),
+            frame_inputs=_frame_inputs(configuration.get("frameInputs", []), target),
             secret_files=_secret_files(configuration.get("secretFiles", [])),
             configuration=configuration,
         )
@@ -187,6 +189,23 @@ def _inputs(value: object) -> tuple[str, ...]:
     if any(_has_control(topic) for topic in inputs):
         raise ConfigError("configuration.inputs must not contain control characters")
     return inputs
+
+
+def _frame_inputs(value: object, target: Target) -> tuple[str, ...]:
+    """The frame topics of the modules that forward frames to this one, as the deploy renders
+    them: exactly output/frames/<this tenant>/<node>/<module>."""
+    topics = _strings(value, "configuration.frameInputs")
+    for topic in topics:
+        levels = topic.split("/")
+        if (
+            len(levels) != 5
+            or levels[:3] != ["output", "frames", target.tenant_config_id]
+            or not all(valid_segment(level) for level in levels[3:])
+        ):
+            raise ConfigError(
+                "configuration.frameInputs entries must be output/frames/<tenant>/<node>/<module>"
+            )
+    return topics
 
 
 def _secret_files(value: object) -> tuple[str, ...]:

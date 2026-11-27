@@ -10,6 +10,11 @@ def telemetry_topic(target: Target) -> str:
     return f"output/telemetry/{target.tenant_config_id}/{target.node_id}/{target.module_id}/v"
 
 
+def frame_topic(target: Target) -> str:
+    """Where the module publishes its image frames, which stay on the cluster."""
+    return f"output/frames/{target.tenant_config_id}/{target.node_id}/{target.module_id}"
+
+
 def command_topic(target: Target) -> str:
     """The prefix of the module's commands: `<prefix>/<delivery>/<command>`."""
     return f"input/directmethod/{target.tenant_config_id}/{target.cluster_id}/{target.module_id}"
