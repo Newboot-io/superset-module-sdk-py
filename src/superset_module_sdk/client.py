@@ -236,16 +236,16 @@ class ModuleClient:
         payload = data if isinstance(data, bytes) else bytes(data)
         if self._packet_bytes(self._frame_topic, properties, payload) > self._frame_limit():
             raise FrameError("frame is larger than the broker accepts")
-        if not self.is_connected() or not self._frame_slot():
-            self._flow.record(operation=FlowOperation.ENQUEUE, success=False)
-            return False
-        info = self._client.publish(
-            self._frame_topic, payload, qos=0, retain=False, properties=properties
-        )
-        accepted = info.rc == mqtt.MQTT_ERR_SUCCESS
-        if accepted:
-            with self._frames_lock:
-                self._frames_in_flight.append(info)
+        # One lock over the slot check, the publish and the count: concurrent senders share it.
+        with self._frames_lock:
+            accepted = self.is_connected() and self._frame_slot()
+            if accepted:
+                info = self._client.publish(
+                    self._frame_topic, payload, qos=0, retain=False, properties=properties
+                )
+                accepted = info.rc == mqtt.MQTT_ERR_SUCCESS
+                if accepted:
+                    self._frames_in_flight.append(info)
         self._flow.record(operation=FlowOperation.ENQUEUE, success=accepted)
         return accepted
 
@@ -272,12 +272,15 @@ class ModuleClient:
         self._flow.connection(False)
 
     def _frame_slot(self) -> bool:
-        """Whether one more frame may be handed to paho: frames it has written leave the count,
-        and a reconnection marks the frames it discards as written."""
-        with self._frames_lock:
-            while self._frames_in_flight and self._frames_in_flight[0].is_published():
-                self._frames_in_flight.popleft()
-            return len(self._frames_in_flight) < MAX_FRAMES_IN_FLIGHT
+        """Whether one more frame may be handed to paho (call it holding _frames_lock). A frame
+        leaves the count once written, or once failed: a reconnection marks the frames it
+        discards with an error code, for which paho's is_published() raises instead."""
+        while self._frames_in_flight:
+            head = self._frames_in_flight[0]
+            if head.rc <= 0 and not head.is_published():
+                break
+            self._frames_in_flight.popleft()
+        return len(self._frames_in_flight) < MAX_FRAMES_IN_FLIGHT
 
     def _frame_limit(self) -> int:
         # A frame fits the platform's 2 MiB and the broker's own limit, whichever is smaller.
@@ -332,6 +335,8 @@ class ModuleClient:
             return
         announced = getattr(properties, "MaximumPacketSize", None)
         self._broker_max_packet = announced if isinstance(announced, int) else MAX_FRAME_BYTES
+        with self._frames_lock:  # frames of a previous connection were never written
+            self._frames_in_flight.clear()
         # The superset broker sends stored messages with the retain flag set, and they are
         # dropped; live ones arrive with the flag cleared. Other brokers skip stored ones.
         options = SubscribeOptions(

@@ -300,12 +300,13 @@ def paho_packet(topic: str, properties: Properties, payload: bytes) -> bytes:
 @pytest.mark.parametrize(
     # Around each remaining-length boundary: 127/128 and 16383/16384 bytes.
     "remaining",
-    [3, 127, 128, 129, 16383, 16384, 16385, 2 * 1024 * 1024 - 200],
+    [64, 127, 128, 129, 16383, 16384, 16385, 2 * 1024 * 1024 - 200],
 )
 def test_packet_size_matches_what_paho_encodes(remaining: int) -> None:
     topic = "t"
     properties = publish_properties("image/jpeg", [("timestamp", "1")])
     overhead = 2 + len(topic) + len(properties.pack())  # type: ignore[no-untyped-call]
+    assert remaining > overhead  # a real payload, not an empty one
     payload = b"x" * (remaining - overhead)
     assert len(paho_packet(topic, properties, payload)) == ModuleClient._packet_bytes(
         topic, properties, payload
@@ -322,10 +323,38 @@ def test_send_frame_drops_frames_while_the_previous_ones_are_unwritten(
     assert not sdk.send_frame(JPEG, "image/jpeg")
     assert len(fake.frames) == 2
     assert operations(sdk, FlowOperation.ENQUEUE) == (2, 1)
-    fake.infos[0].written = True  # the first is written: one slot frees up
+    fake.infos[0]._set_as_published()  # paho wrote the first: one slot frees up
     assert sdk.send_frame(JPEG, "image/jpeg")
     assert not sdk.send_frame(JPEG, "image/jpeg")
     assert len(fake.frames) == 3
+
+
+def lose_connection(fake: FakeMqtt) -> None:
+    """What paho's reconnect() does to the QoS 0 packets it had not written."""
+    for info in fake.infos:
+        if not info._published:
+            info.rc = mqtt.MQTT_ERR_CONN_LOST
+            info._set_as_published()
+
+
+def test_frames_lost_in_a_reconnection_free_their_slots(sdk: ModuleClient, fake: FakeMqtt) -> None:
+    fake.writes = False
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    lose_connection(fake)
+    with pytest.raises(RuntimeError):
+        fake.infos[0].is_published()  # why the bound must not ask paho about a lost frame
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    assert not sdk.send_frame(JPEG, "image/jpeg")
+
+
+def test_a_new_connection_frees_every_slot(sdk: ModuleClient, fake: FakeMqtt) -> None:
+    fake.writes = False
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    connack(sdk, fake, None)
+    assert sdk.send_frame(JPEG, "image/jpeg")
 
 
 def test_a_refused_publish_takes_no_slot(sdk: ModuleClient, fake: FakeMqtt) -> None:
@@ -337,7 +366,13 @@ def test_a_refused_publish_takes_no_slot(sdk: ModuleClient, fake: FakeMqtt) -> N
     assert sdk.send_frame(JPEG, "image/jpeg")
 
 
-def test_send_frame_refuses_an_oversized_buffer_before_copying_it(sdk: ModuleClient) -> None:
+def test_send_frame_refuses_an_oversized_buffer_before_copying_it(
+    sdk: ModuleClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_packet(*_args: Any) -> int:
+        raise AssertionError("the size is checked before the packet is built")
+
+    monkeypatch.setattr(ModuleClient, "_packet_bytes", staticmethod(no_packet))
     with pytest.raises(FrameError, match="larger than the broker accepts"):
         sdk.send_frame(bytearray(MAX_FRAME_BYTES + 1), "image/jpeg")
 

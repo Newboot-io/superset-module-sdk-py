@@ -16,7 +16,8 @@ Sister libraries with the same API shape and the same wire behaviour:
 [superset-module-sdk-ts](https://github.com/Newboot-io/superset-module-sdk-ts) (TypeScript) and
 [superset-module-sdk-rs](https://github.com/Newboot-io/superset-module-sdk-rs) (Rust). Image
 frames (`send_frame`, `on_frame`) are in this SDK only as of 0.2.0; the TypeScript and Rust SDKs
-follow ([newboot-mq#387](https://github.com/Newboot-io/newboot-mq/issues/387)), with the same rules.
+follow later, with the same rules (see
+[newboot-mq#387](https://github.com/Newboot-io/newboot-mq/issues/387)).
 
 ## Requirements
 
