@@ -193,8 +193,12 @@ def _inputs(value: object) -> tuple[str, ...]:
 
 def _frame_inputs(value: object, target: Target) -> tuple[str, ...]:
     """The frame topics of the modules that forward frames to this one, as the deploy renders
-    them: exactly output/frames/<this tenant>/<node>/<module>."""
-    topics = _strings(value, "configuration.frameInputs")
+    them: exactly output/frames/<this tenant>/<node>/<module>, once each, never this module's
+    own (it would receive its own frames)."""
+    topics = tuple(dict.fromkeys(_strings(value, "configuration.frameInputs")))
+    own = f"output/frames/{target.tenant_config_id}/{target.node_id}/{target.module_id}"
+    if own in topics:
+        raise ConfigError("configuration.frameInputs must not hold this module's own frame topic")
     for topic in topics:
         levels = topic.split("/")
         if (

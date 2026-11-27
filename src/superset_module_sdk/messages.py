@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ._json import dump_json, is_int, parse_json, valid_segment
@@ -18,6 +18,8 @@ DELIVERIES = ("broadcast", "unicast")
 MAX_FRAME_BYTES = 2 * 1024 * 1024
 FRAME_ID_PROPERTY = "frameId"
 FRAME_TIMESTAMP_PROPERTY = "timestamp"
+# 2^53 - 1, the largest timestamp, has 16 digits: longer text is refused before int() reads it.
+MAX_TIMESTAMP_DIGITS = 16
 # A plain type/subtype media type, such as image/jpeg: no parameters, at most 127 characters.
 _CONTENT_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]*")
 MAX_CONTENT_TYPE_LENGTH = 127
@@ -138,12 +140,12 @@ def valid_content_type(value: object) -> bool:
     )
 
 
-def frame_metadata(
-    content_type: str, frame_id: str | None, timestamp: int | float | None
-) -> tuple[str, list[tuple[str, str]]]:
-    """The content type and user properties of a frame to send: frameId when given, and
-    timestamp (epoch ms, now when not given). Raises FrameError naming the field that is
-    invalid."""
+def frame_properties(
+    content_type: object, frame_id: str | None, timestamp: int | float | None
+) -> list[tuple[str, str]]:
+    """The user properties of a frame to send, after checking its content type: frameId when
+    given, and timestamp (epoch ms, now when not given). Raises FrameError naming the field that
+    is invalid."""
     if not valid_content_type(content_type):
         raise FrameError("frame content type is not a type/subtype media type")
     properties: list[tuple[str, str]] = []
@@ -155,25 +157,28 @@ def frame_metadata(
     if stamp is None:
         raise FrameError("frame timestamp is not valid")
     properties.append((FRAME_TIMESTAMP_PROPERTY, str(stamp)))
-    return content_type, properties
+    return properties
 
 
 @dataclass(frozen=True)
 class Frame:
     """An image frame from a module the superset forwards to this one (configuration.frameInputs).
-    `data` holds the image bytes as sent; `module_id` names the module that sent it."""
+    `data` holds the image bytes as sent (left out of repr, so logging a frame never dumps it);
+    `module_id` names the module that sent it."""
 
     topic: str
     module_id: str
-    data: bytes
+    data: bytes = field(repr=False)
     content_type: str | None
     frame_id: str | None
     timestamp: int | None
 
 
 def _frame_timestamp(text: str) -> int | None:
-    # Decimal digits only: no sign, no space, no exponent.
-    return timestamp_ms(int(text)) if text.isascii() and text.isdigit() else None
+    # Decimal ASCII digits only: no sign, space or exponent, and few enough for int() to stay cheap.
+    if not (text.isascii() and text.isdigit() and len(text) <= MAX_TIMESTAMP_DIGITS):
+        return None
+    return timestamp_ms(int(text))
 
 
 def parse_frame(

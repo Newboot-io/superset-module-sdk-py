@@ -7,6 +7,7 @@ import logging
 import socket
 import ssl
 import threading
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -32,7 +33,7 @@ from .messages import (
     Command,
     Frame,
     Telemetry,
-    frame_metadata,
+    frame_properties,
     now_ms,
     parse_command,
     parse_frame,
@@ -51,6 +52,9 @@ MAX_PACKET_BYTES = 2 * 1024 * 1024 + 1024
 # A fixed delay between connection attempts, the same in the three SDKs (paho would otherwise back
 # off up to 120 s).
 RECONNECT_AFTER_S = 5
+# Frames handed to paho but not yet written to the socket. paho queues QoS 0 packets without a
+# bound while a connection stalls, so past this many send_frame drops the new frame.
+MAX_FRAMES_IN_FLIGHT = 2
 
 TelemetryHandler = Callable[[Telemetry], None]
 FrameHandler = Callable[[Frame], None]
@@ -80,6 +84,8 @@ class ModuleClient:
         self._frame_topic = frame_topic(config.target)
         # The broker's own packet limit, from its CONNACK; 2 MiB until it announces one.
         self._broker_max_packet = MAX_FRAME_BYTES
+        self._frames_in_flight: deque[mqtt.MQTTMessageInfo] = deque()
+        self._frames_lock = threading.Lock()
         self._command_prefix = command_topic(config.target) + "/"
         self._tls: ssl.SSLContext | None = None
         self._twin: ModuleTwin | None = None
@@ -163,8 +169,9 @@ class ModuleClient:
 
     @property
     def flow(self) -> Flow:
-        """The flow metrics this client records: the MQTT connection, inputs received and
-        processed, telemetry enqueued. A module that reads hardware records `acquire` here."""
+        """The flow metrics this client records: the MQTT connection, inputs and frames received
+        and processed, telemetry and frames enqueued. A module that reads hardware records
+        `acquire` here."""
         return self._flow
 
     def metrics(self) -> str:
@@ -201,7 +208,7 @@ class ModuleClient:
 
     def send_frame(
         self,
-        data: bytes,
+        data: bytes | bytearray | memoryview,
         content_type: str,
         *,
         frame_id: str | None = None,
@@ -212,26 +219,33 @@ class ModuleClient:
         type (such as image/jpeg) and the frameId and timestamp (epoch ms, now when not given)
         travel as MQTT v5 properties. Raises FrameError for invalid metadata or a frame the
         broker would refuse as too large. Returns False when the client is not connected (also
-        before connect()) or the MQTT client refuses the publish: the frame is dropped and
-        counted as an enqueue error."""
+        before connect()), when the previous frames are still being written (a stalled
+        connection never piles frames up in memory), or when the MQTT client refuses the
+        publish: the frame is dropped and counted as an enqueue error."""
         if not isinstance(data, bytes | bytearray | memoryview):
             raise FrameError("frame data is not bytes")
-        payload = bytes(data)
-        if not payload:
+        size = memoryview(data).nbytes  # checked before any copy of a large buffer
+        if size == 0:
             raise FrameError("frame data is empty")
-        content_type, user_properties = frame_metadata(content_type, frame_id, timestamp)
+        if size > self._frame_limit():
+            raise FrameError("frame is larger than the broker accepts")
+        user_properties = frame_properties(content_type, frame_id, timestamp)
         properties = Properties(PacketTypes.PUBLISH)  # type: ignore[no-untyped-call]
         properties.ContentType = content_type
         properties.UserProperty = user_properties
+        payload = data if isinstance(data, bytes) else bytes(data)
         if self._packet_bytes(self._frame_topic, properties, payload) > self._frame_limit():
             raise FrameError("frame is larger than the broker accepts")
-        if not self.is_connected():
+        if not self.is_connected() or not self._frame_slot():
             self._flow.record(operation=FlowOperation.ENQUEUE, success=False)
             return False
         info = self._client.publish(
             self._frame_topic, payload, qos=0, retain=False, properties=properties
         )
         accepted = info.rc == mqtt.MQTT_ERR_SUCCESS
+        if accepted:
+            with self._frames_lock:
+                self._frames_in_flight.append(info)
         self._flow.record(operation=FlowOperation.ENQUEUE, success=accepted)
         return accepted
 
@@ -256,6 +270,14 @@ class ModuleClient:
         self._client.loop_stop()
         self._subscribed = False
         self._flow.connection(False)
+
+    def _frame_slot(self) -> bool:
+        """Whether one more frame may be handed to paho: frames it has written leave the count,
+        and a reconnection marks the frames it discards as written."""
+        with self._frames_lock:
+            while self._frames_in_flight and self._frames_in_flight[0].is_published():
+                self._frames_in_flight.popleft()
+            return len(self._frames_in_flight) < MAX_FRAMES_IN_FLIGHT
 
     def _frame_limit(self) -> int:
         # A frame fits the platform's 2 MiB and the broker's own limit, whichever is smaller.

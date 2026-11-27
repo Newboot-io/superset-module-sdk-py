@@ -50,10 +50,14 @@ def dump_json(value: Any) -> str:
 
 def valid_segment(value: object) -> bool:
     """A topic level or id: non-empty, at most 200 bytes, no control character, /, + or #."""
-    return (
-        isinstance(value, str)
-        and 0 < len(value.encode()) <= MAX_SEGMENT_BYTES
-        and not any(c in "/+#" or unicodedata.category(c) == "Cc" for c in value)
+    if not isinstance(value, str):
+        return False
+    try:
+        size = len(value.encode())
+    except UnicodeEncodeError:  # a lone surrogate is no UTF-8 text
+        return False
+    return 0 < size <= MAX_SEGMENT_BYTES and not any(
+        c in "/+#" or unicodedata.category(c) == "Cc" for c in value
     )
 
 

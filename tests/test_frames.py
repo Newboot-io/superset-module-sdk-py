@@ -6,9 +6,11 @@ from typing import Any, cast
 
 import paho.mqtt.client as mqtt
 import pytest
+from paho.mqtt.enums import CallbackAPIVersion
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.properties import Properties
 from paho.mqtt.reasoncodes import ReasonCode
+from paho.mqtt.subscribeoptions import SubscribeOptions
 from test_client import FakeMqtt
 
 import superset_module_sdk.client as client_module
@@ -22,7 +24,7 @@ from superset_module_sdk import (
 )
 from superset_module_sdk.messages import (
     MAX_FRAME_BYTES,
-    frame_metadata,
+    frame_properties,
     parse_frame,
     valid_content_type,
 )
@@ -99,6 +101,17 @@ def test_frame_inputs_must_be_this_tenants_frame_topics(
         ModuleConfig.parse(raw_config)
 
 
+def test_frame_inputs_are_read_once_each(raw_config: dict[str, Any]) -> None:
+    raw_config["configuration"]["frameInputs"] = [CAMERA, CAMERA]
+    assert ModuleConfig.parse(raw_config).frame_inputs == (CAMERA,)
+
+
+def test_frame_inputs_never_hold_the_modules_own_frames(raw_config: dict[str, Any]) -> None:
+    raw_config["configuration"]["frameInputs"] = [OWN_FRAMES]
+    with pytest.raises(ConfigError, match="own frame topic"):
+        ModuleConfig.parse(raw_config)
+
+
 def test_frame_inputs_must_be_a_list_of_strings(raw_config: dict[str, Any]) -> None:
     raw_config["configuration"]["frameInputs"] = CAMERA
     with pytest.raises(ConfigError, match="frameInputs"):
@@ -108,28 +121,31 @@ def test_frame_inputs_must_be_a_list_of_strings(raw_config: dict[str, Any]) -> N
 # Frame rules ---------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["image/jpeg", "image/png", "application/octet-stream"])
+@pytest.mark.parametrize(
+    "value", ["image/jpeg", "image/png", "application/octet-stream", "a/" + "b" * 125]
+)
 def test_plain_media_types_are_content_types(value: str) -> None:
     assert valid_content_type(value)
 
 
 @pytest.mark.parametrize(
-    "value", ["", "image", "image/", "/jpeg", "image/jpeg; q=1", "image /jpeg", 3, None, "a/" * 70]
+    "value",
+    ["", "image", "image/", "/jpeg", "image/jpeg; q=1", "image /jpeg", 3, None, "a/" + "b" * 126],
 )
 def test_other_values_are_not_content_types(value: object) -> None:
     assert not valid_content_type(value)
 
 
-def test_frame_metadata_carries_the_frame_id_and_timestamp() -> None:
-    assert frame_metadata("image/jpeg", "f-1", 1_700_000_000_000) == (
-        "image/jpeg",
-        [("frameId", "f-1"), ("timestamp", "1700000000000")],
-    )
+def test_frame_properties_carry_the_frame_id_and_timestamp() -> None:
+    assert frame_properties("image/jpeg", "f-1", 1_700_000_000_000) == [
+        ("frameId", "f-1"),
+        ("timestamp", "1700000000000"),
+    ]
 
 
-def test_frame_metadata_stamps_now_without_a_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_frame_properties_stamp_now_without_a_timestamp(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("superset_module_sdk.messages.now_ms", lambda: 42)
-    assert frame_metadata("image/png", None, None) == ("image/png", [("timestamp", "42")])
+    assert frame_properties("image/png", None, None) == [("timestamp", "42")]
 
 
 @pytest.mark.parametrize(
@@ -138,6 +154,7 @@ def test_frame_metadata_stamps_now_without_a_timestamp(monkeypatch: pytest.Monke
         ("jpeg", None, None, "content type"),
         ("image/jpeg", "a/b", None, "frame id"),
         ("image/jpeg", "", None, "frame id"),
+        ("image/jpeg", "\ud800", None, "frame id"),  # a lone surrogate is no UTF-8 text
         ("image/jpeg", None, -1, "timestamp"),
         ("image/jpeg", None, 1.5, "timestamp"),
     ],
@@ -146,7 +163,17 @@ def test_invalid_frame_metadata_is_refused(
     content_type: str, frame_id: str | None, timestamp: float | None, field: str
 ) -> None:
     with pytest.raises(FrameError, match=field):
-        frame_metadata(content_type, frame_id, timestamp)
+        frame_properties(content_type, frame_id, timestamp)
+
+
+def test_a_frames_repr_leaves_its_bytes_out() -> None:
+    frame = Frame(CAMERA, "camera", b"\x00" * 1000, "image/jpeg", "f-1", 5)
+    assert "data" not in repr(frame)
+    assert "f-1" in repr(frame)
+
+
+def test_a_frame_of_exactly_2_mib_is_kept() -> None:
+    assert parse_frame(CAMERA, b"x" * MAX_FRAME_BYTES, False, None, []) is not None
 
 
 def test_a_frame_is_parsed_with_its_metadata() -> None:
@@ -182,6 +209,8 @@ def test_a_frame_without_metadata_is_kept() -> None:
         (JPEG, False, "image/jpeg", [("timestamp", "-1")]),
         (JPEG, False, "image/jpeg", [("timestamp", "1e3")]),
         (JPEG, False, "image/jpeg", [("timestamp", str(2**53))]),
+        (JPEG, False, "image/jpeg", [("timestamp", "9" * 5000)]),  # past int()'s digit limit
+        (JPEG, False, "image/jpeg", [("timestamp", "0" * 17)]),
         (JPEG, False, "image/jpeg", [("timestamp", "١")]),  # an Arabic-Indic digit
     ],
 )
@@ -245,11 +274,72 @@ def test_send_frame_counts_the_topic_and_properties_in_the_packet(
         sdk.send_frame(fits + b"x", "image/jpeg", timestamp=1)
 
 
-def test_packet_size_counts_a_multi_byte_remaining_length() -> None:
-    properties = publish_properties(None, [])
-    small = ModuleClient._packet_bytes("t", properties, b"x" * 100)
-    large = ModuleClient._packet_bytes("t", properties, b"x" * 200)
-    assert large - small == 101  # the remaining length takes a second byte past 127
+class ClosedSocket:
+    """Stands for a socket paho never writes to; paho closes it when the client goes away."""
+
+    def close(self) -> None:
+        pass
+
+
+def paho_packet(topic: str, properties: Properties, payload: bytes) -> bytes:
+    """The PUBLISH packet paho itself encodes, caught where it would be queued for the socket
+    (paho only needs a socket to be set; nothing is written)."""
+    client = mqtt.Client(CallbackAPIVersion.VERSION2, protocol=mqtt.MQTTv5)
+    packets: list[bytes] = []
+
+    def queue(_command: int, packet: bytes | bytearray, *_args: Any, **_kwargs: Any) -> int:
+        packets.append(bytes(packet))
+        return mqtt.MQTT_ERR_SUCCESS
+
+    client._packet_queue = queue  # type: ignore[method-assign,assignment]
+    client._sock = cast(Any, ClosedSocket())
+    client._send_publish(0, topic.encode(), payload, 0, False, False, None, properties)
+    return packets[0]
+
+
+@pytest.mark.parametrize(
+    # Around each remaining-length boundary: 127/128 and 16383/16384 bytes.
+    "remaining",
+    [3, 127, 128, 129, 16383, 16384, 16385, 2 * 1024 * 1024 - 200],
+)
+def test_packet_size_matches_what_paho_encodes(remaining: int) -> None:
+    topic = "t"
+    properties = publish_properties("image/jpeg", [("timestamp", "1")])
+    overhead = 2 + len(topic) + len(properties.pack())  # type: ignore[no-untyped-call]
+    payload = b"x" * (remaining - overhead)
+    assert len(paho_packet(topic, properties, payload)) == ModuleClient._packet_bytes(
+        topic, properties, payload
+    )
+
+
+def test_send_frame_drops_frames_while_the_previous_ones_are_unwritten(
+    sdk: ModuleClient, fake: FakeMqtt
+) -> None:
+    """A stalled connection: paho would queue QoS 0 frames without a bound."""
+    fake.writes = False
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    assert not sdk.send_frame(JPEG, "image/jpeg")
+    assert len(fake.frames) == 2
+    assert operations(sdk, FlowOperation.ENQUEUE) == (2, 1)
+    fake.infos[0].written = True  # the first is written: one slot frees up
+    assert sdk.send_frame(JPEG, "image/jpeg")
+    assert not sdk.send_frame(JPEG, "image/jpeg")
+    assert len(fake.frames) == 3
+
+
+def test_a_refused_publish_takes_no_slot(sdk: ModuleClient, fake: FakeMqtt) -> None:
+    fake.writes = False
+    fake.publish_rc = mqtt.MQTT_ERR_NO_CONN
+    for _ in range(3):
+        assert not sdk.send_frame(JPEG, "image/jpeg")
+    fake.publish_rc = mqtt.MQTT_ERR_SUCCESS
+    assert sdk.send_frame(JPEG, "image/jpeg")
+
+
+def test_send_frame_refuses_an_oversized_buffer_before_copying_it(sdk: ModuleClient) -> None:
+    with pytest.raises(FrameError, match="larger than the broker accepts"):
+        sdk.send_frame(bytearray(MAX_FRAME_BYTES + 1), "image/jpeg")
 
 
 def test_send_frame_returns_false_when_not_connected(sdk: ModuleClient, fake: FakeMqtt) -> None:
@@ -262,7 +352,7 @@ def test_send_frame_returns_false_when_not_connected(sdk: ModuleClient, fake: Fa
 def test_send_frame_returns_false_when_the_publish_is_refused(
     sdk: ModuleClient, fake: FakeMqtt
 ) -> None:
-    fake.publish_rc = mqtt.MQTT_ERR_QUEUE_SIZE
+    fake.publish_rc = mqtt.MQTT_ERR_NO_CONN
     assert not sdk.send_frame(JPEG, "image/jpeg")
     assert operations(sdk, FlowOperation.ENQUEUE) == (0, 1)
 
@@ -284,6 +374,7 @@ def test_frame_inputs_are_subscribed_at_qos_0(sdk: ModuleClient, fake: FakeMqtt)
     [subscriptions] = fake.subscriptions
     options = dict(subscriptions)
     assert options[CAMERA].QoS == 0
+    assert options[CAMERA].retainHandling == SubscribeOptions.RETAIN_DO_NOT_SEND
     assert options["output/telemetry/tenant-a/node-a/sensor/v"].QoS == 1
 
 
@@ -338,6 +429,15 @@ def test_a_retained_frame_is_neither_received_nor_processed(sdk: ModuleClient) -
     sdk._handle(CAMERA, JPEG, True, None)
     assert seen == []
     assert operations(sdk, FlowOperation.RECEIVE) == (0, 0)
+
+
+def test_a_frame_with_an_endless_timestamp_is_received_but_not_processed(
+    sdk: ModuleClient, fake: FakeMqtt
+) -> None:
+    properties = publish_properties("image/jpeg", [("timestamp", "9" * 5000)])
+    sdk._on_message(cast(mqtt.Client, fake), None, frame_message(CAMERA, JPEG, properties))
+    assert operations(sdk, FlowOperation.RECEIVE) == (1, 0)
+    assert operations(sdk, FlowOperation.PROCESS) == (0, 1)
 
 
 def test_a_failing_frame_handler_is_logged_by_type_only(

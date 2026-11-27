@@ -41,6 +41,10 @@ TWIN: ModuleTwin = {"serverport": 4840, "variables": {"v": {"name": "Boiler"}}}
 
 class Published:
     rc: int = mqtt.MQTT_ERR_SUCCESS
+    written: bool = True  # whether paho has written the packet to the socket
+
+    def is_published(self) -> bool:
+        return self.written
 
 
 class FakeMqtt:
@@ -59,6 +63,8 @@ class FakeMqtt:
         self.calls: list[tuple[str, Any]] = []
         self.subscriptions: list[Any] = []
         self.publish_rc: int = mqtt.MQTT_ERR_SUCCESS
+        self.writes: bool = True  # False: a stalled socket, where publishes stay unwritten
+        self.infos: list[Published] = []
         self.reconnect_delay: tuple[int, int] | None = None
 
     def publish(
@@ -71,6 +77,8 @@ class FakeMqtt:
             self.frames.append((topic, payload, qos, retain, properties))
         result = Published()
         result.rc = self.publish_rc
+        result.written = self.writes
+        self.infos.append(result)
         return result
 
     def is_connected(self) -> bool:
