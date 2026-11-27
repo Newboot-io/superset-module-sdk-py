@@ -39,15 +39,13 @@ SCOPE = {"clusterId": "cluster-a", "moduleId": "my-module", "tenantConfigId": "t
 TWIN: ModuleTwin = {"serverport": 4840, "variables": {"v": {"name": "Boiler"}}}
 
 
-class Published:
-    rc: int = mqtt.MQTT_ERR_SUCCESS
-
-
 class FakeMqtt:
     """Just what ModuleClient uses of paho's client."""
 
     def __init__(self) -> None:
         self.published: list[tuple[str, dict[str, Any], int, bool]] = []
+        # Publishes with MQTT v5 properties (image frames): raw payload and properties.
+        self.frames: list[tuple[str, bytes, int, bool, Any]] = []
         self.on_connect: Any = None
         self.on_connect_fail: Any = None
         self.on_disconnect: Any = None
@@ -57,12 +55,25 @@ class FakeMqtt:
         self.calls: list[tuple[str, Any]] = []
         self.subscriptions: list[Any] = []
         self.publish_rc: int = mqtt.MQTT_ERR_SUCCESS
+        # False: a stalled socket, where publishes stay unwritten.
+        self.writes: bool = True
+        # paho's own MQTTMessageInfo, so is_published() behaves as it does, raising included.
+        self.infos: list[mqtt.MQTTMessageInfo] = []
         self.reconnect_delay: tuple[int, int] | None = None
 
-    def publish(self, topic: str, payload: str, qos: int, retain: bool) -> Published:
-        self.published.append((topic, json.loads(payload), qos, retain))
-        result = Published()
-        result.rc = self.publish_rc
+    def publish(
+        self, topic: str, payload: str | bytes, qos: int, retain: bool, properties: Any = None
+    ) -> mqtt.MQTTMessageInfo:
+        if properties is None:
+            self.published.append((topic, json.loads(payload), qos, retain))
+        else:
+            assert isinstance(payload, bytes)
+            self.frames.append((topic, payload, qos, retain, properties))
+        result = mqtt.MQTTMessageInfo(len(self.infos) + 1)
+        result.rc = self.publish_rc  # type: ignore[assignment]
+        if self.writes and self.publish_rc == mqtt.MQTT_ERR_SUCCESS:
+            result._set_as_published()
+        self.infos.append(result)
         return result
 
     def is_connected(self) -> bool:

@@ -7,12 +7,17 @@ for you, so a module can:
 - read its **secrets**,
 - **send telemetry** on its own topic,
 - **receive telemetry** from the modules the Superset links to it,
+- **send and receive image frames** with the modules the Superset forwards frames between, on the
+  cluster only,
 - follow **twin changes**: the built-in answer to the Superset's `reload` command,
 - report its **activity**: the [flow metrics](#flow-metrics) the Newboot console reads.
 
 Sister libraries with the same API shape and the same wire behaviour:
 [superset-module-sdk-ts](https://github.com/Newboot-io/superset-module-sdk-ts) (TypeScript) and
-[superset-module-sdk-rs](https://github.com/Newboot-io/superset-module-sdk-rs) (Rust).
+[superset-module-sdk-rs](https://github.com/Newboot-io/superset-module-sdk-rs) (Rust). Image
+frames (`send_frame`, `on_frame`) are in this SDK only as of 0.2.0; the TypeScript and Rust SDKs
+follow later, with the same rules (see
+[newboot-mq#387](https://github.com/Newboot-io/newboot-mq/issues/387)).
 
 ## Requirements
 
@@ -26,7 +31,7 @@ Sister libraries with the same API shape and the same wire behaviour:
 The package is installed from GitHub for now; package registries come later.
 
 ```sh
-pip install "superset-module-sdk @ git+https://github.com/Newboot-io/superset-module-sdk-py@v0.1.0"
+pip install "superset-module-sdk @ git+https://github.com/Newboot-io/superset-module-sdk-py@v0.2.0"
 ```
 
 Import it as `superset_module_sdk`.
@@ -89,6 +94,7 @@ Errors, all exported from `superset_module_sdk`:
 | `SecretError` | A secret is not declared, cannot be read, or is not a string. |
 | `TwinError` | No twin is configured, or a twin fetch or its answer fails. |
 | `TelemetryError` | A telemetry message breaks the payload rules. |
+| `FrameError` | An image frame or its metadata breaks the rules of `send_frame`, or is too large. |
 
 No other exception escapes the public API (catch `SdkError` for all of them). No error message ever
 contains a secret's value or the content of a secret file.
@@ -111,6 +117,8 @@ Reads the module configuration from the file named by the `MODULE_CONFIG` enviro
 - `twin` (optional; `null` is the same as absent): `endpoint` (an `https` URL), `identity` and `ca`
   non-empty paths;
 - `configuration.inputs`: topics, without `+`, `#` or control characters;
+- `configuration.frameInputs`: frame topics, each exactly
+  `output/frames/<this module's tenant>/<node>/<module>`, levels valid as in `target`;
 - `configuration.secretFiles`: non-empty paths, each ending in `.json`.
 
 - **Raises** `UnsupportedModeError` for any other `mqtt.mode`, `ConfigError` when the file is
@@ -239,6 +247,50 @@ the payload rules of `send_telemetry` (for example nested values, or `"name": nu
 Handlers run on the MQTT thread; an exception in one is logged by type only (never with payload
 values) and does not stop the others.
 
+### `send_frame(data, content_type, *, frame_id=None, timestamp=None) -> bool`
+
+Publishes one image frame on `output/frames/<tenant>/<node>/<module>`, QoS 0, not retained, for the
+modules the Superset forwards this module's frames to. Frames stay on the cluster: no dataflow
+sends them to the cloud. The broker grants the module that topic only when a variable of model
+`dtmi:com:newboot:var_image_frame;1` is linked to the module on the cluster and a `telemetry`
+connection leads to another module of the deployed superset (redeploy after linking it);
+otherwise it drops the frames silently, and `send_frame` cannot tell (QoS 0 has no answer).
+
+- `data`: the image bytes as they are (`bytes`, `bytearray` or `memoryview`), not empty.
+- `content_type`: a plain `type/subtype` media type such as `image/jpeg` (no parameters, at most
+  127 characters), sent as the MQTT v5 content type.
+- `frame_id`: optional, an id valid as a topic level; sent as the `frameId` user property.
+- `timestamp`: the capture time in epoch milliseconds, as for `send_telemetry`; defaults to now.
+  Sent as the `timestamp` user property, in decimal.
+- The whole PUBLISH packet (topic, properties and data) must fit within 2 MiB and the maximum
+  packet size the broker announced in its CONNACK, whichever is smaller.
+- At most two frames wait to be written to the socket: while two do, the new frame is dropped.
+  paho would otherwise queue QoS 0 frames without a bound on a stalled connection.
+- **Returns** `True` when handed to the connected client; `False` when the client is not connected
+  and subscribed, two frames are still being written, or the MQTT client refuses the publish.
+  Every `False` counts as an `enqueue` error. Nothing is queued while disconnected.
+- **Raises** `FrameError` naming what is invalid: the data, the content type, the frame id, the
+  timestamp, or a frame the broker would refuse as too large.
+
+### `on_frame(handler: Callable[[Frame], None]) -> None`
+
+Adds a handler for frames on the topics the Superset forwards to this module
+(`configuration.frameInputs`, subscribed at QoS 0); several handlers run in registration order.
+`Frame` has `topic`, `module_id` (the module that sent it), `data` (the bytes, left out of its
+`repr`), `content_type`, `frame_id` and `timestamp` (each `None` when absent). The SDK drops,
+before any handler sees them:
+
+- retained frames, empty frames and frames over 2 MiB;
+- a content type that is not a plain `type/subtype` (parameters included);
+- a `frameId` that is not a valid topic level, or a `timestamp` that is not 1 to 16 ASCII decimal
+  digits worth at most 2^53-1;
+- a `frameId` or `timestamp` given twice. Other user properties are ignored.
+
+These are this SDK's rules, which a sending module that does not use it must follow too. A frame
+counts as received and processed in the [flow metrics](#flow-metrics), like telemetry. Handlers
+run on the MQTT thread: hand long work, such as inference, to another thread. An exception in one
+is logged by type only and does not stop the others.
+
 ### `on_twin_change(handler: Callable[[ModuleTwin], None]) -> None`
 
 Adds a handler (several run in registration order) called with the freshly fetched twin when the
@@ -268,9 +320,9 @@ The client records each operation once, where it happens:
 | Operation | Counted by | Success | Error |
 | --- | --- | --- | --- |
 | `acquire` | Your module, through `client.flow` (stays 0 otherwise) | A read from the machine | A failed read or connection |
-| `receive` | The SDK | A message on an input topic (`configuration.inputs`), retained ones excepted | Never |
-| `process` | The SDK | The message is valid telemetry and every `on_telemetry` handler returned | The message is dropped (see `on_telemetry`) or a handler raised |
-| `enqueue` | The SDK | `send_telemetry` handed the message to the MQTT client | Not connected and subscribed, or the MQTT client refused it |
+| `receive` | The SDK | A message on an input or frame topic (`configuration.inputs`, `configuration.frameInputs`), retained ones excepted | Never |
+| `process` | The SDK | The message is valid telemetry or a valid frame, and every `on_telemetry` or `on_frame` handler returned | The message is dropped (see `on_telemetry`, `on_frame`) or a handler raised |
+| `enqueue` | The SDK | `send_telemetry` or `send_frame` handed the message to the MQTT client | Not connected and subscribed, two frames still being written (`send_frame`), or the MQTT client refused it |
 
 Commands, `reload` included, and their replies are never counted. The series carry no other label:
 no variable id, topic, value or error. The counters start at zero when the process starts and reset
@@ -308,7 +360,11 @@ and sends no answer.
   which the Superset generates; the SDK only uses the module's own topics and its declared inputs.
 - The client announces a 2 MiB + 1 KiB maximum packet size to the broker on CONNECT. paho enforces
   it only after a packet has been read, so the SDK relies on the broker (trusted, reached over mutual
-  TLS) honouring it. Messages over 8 KiB are then dropped before parsing.
+  TLS) honouring it. Telemetry and commands over 8 KiB, and frames over 2 MiB, are then dropped
+  before parsing.
+- Frames are published only on the module's own frame topic and read only from
+  `configuration.frameInputs`; the broker never forwards them off the cluster. Frame bytes are never
+  logged.
 - Errors from your handlers are logged by type only: their messages may quote values.
 - Run your module the way the Superset does: as uid 10001, read-only root file system, no
   capabilities (see the example Dockerfile).

@@ -23,3 +23,7 @@ class TwinError(SdkError):
 
 class TelemetryError(SdkError):
     """A telemetry message is not valid and was not sent."""
+
+
+class FrameError(SdkError):
+    """An image frame or its metadata is not valid and was not sent."""
