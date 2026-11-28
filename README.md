@@ -373,7 +373,7 @@ and sends no answer.
 
 - Broker connection mode `mutual-tls` only. `from_env()` refuses any other `mqtt.mode` with
   `UnsupportedModeError`.
-- Python 3.10 or later (CI runs 3.10, 3.12 and 3.13), `paho-mqtt` 2.x, `linux/amd64` images.
+- Python 3.10 or later (CI runs 3.10, 3.12 and 3.13), `paho-mqtt` 2.x, `linux/amd64` and `linux/arm64` images.
 
 ## Testing
 
