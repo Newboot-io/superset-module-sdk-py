@@ -68,7 +68,7 @@ From the repository root:
 docker build -f samples/smoother/Dockerfile -t smoother:dev .
 ```
 
-The image is `linux/amd64` and runs as uid 10001 on a read-only root file system, the way the
+The image supports `linux/amd64` and `linux/arm64` and runs as uid 10001 on a read-only root file system, the way the
 Superset runs a module. Built from this repository, the image installs the SDK from this
 checkout. In your own project, depend on the published SDK instead:
 
